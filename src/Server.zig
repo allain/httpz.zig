@@ -72,6 +72,11 @@ pub fn run(self: *Server, io: Io) !void {
 ///
 /// RFC 2616 Section 8.1: Persistent Connections
 fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
+    // RFC 2616 Section 8.1.4: Set socket read timeout for idle connections.
+    if (self.config.keep_alive_timeout_s > 0) {
+        setSocketTimeout(stream.socket.handle, self.config.keep_alive_timeout_s);
+    }
+
     var read_buf: [8192]u8 = undefined;
     var write_buf: [8192]u8 = undefined;
     var net_reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
@@ -83,20 +88,44 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // Read request headers
         const header_len = readHeaders(&net_reader.interface, &request_buf) catch |err| switch (err) {
             error.EndOfStream => return, // Client closed connection
-            else => return err,
+            error.ReadFailed => return, // Timeout or connection reset
         };
 
-        // RFC 2616 Section 8.2.3: Check for Expect: 100-continue.
-        // If present, send "100 Continue" before reading the body.
-        const expect_continue = extractHeaderValue(request_buf[0..header_len], "expect");
-        if (expect_continue != null and Headers.eqlIgnoreCase(expect_continue.?, "100-continue")) {
-            net_writer.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
-            net_writer.interface.flush() catch return;
+        // RFC 2616 Section 14.20: Check for Expect header.
+        // If "100-continue", send 100 Continue before reading body.
+        // If any other expectation, respond with 417 Expectation Failed.
+        const expect_value = extractHeaderValue(request_buf[0..header_len], "expect");
+        if (expect_value) |ev| {
+            if (Headers.eqlIgnoreCase(ev, "100-continue")) {
+                net_writer.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
+                net_writer.interface.flush() catch return;
+            } else {
+                const resp: Response = .{ .status = .expectation_failed, .body = "Expectation Failed" };
+                var resp_buf: [Response.max_response_len]u8 = undefined;
+                const resp_data = resp.serialize(&resp_buf) catch return;
+                net_writer.interface.writeAll(resp_data) catch return;
+                net_writer.interface.flush() catch return;
+                return;
+            }
         }
 
         // Read body based on Transfer-Encoding or Content-Length
         var total = header_len;
         const te = extractHeaderValue(request_buf[0..header_len], "transfer-encoding");
+
+        // RFC 2616 Section 3.6: If an unrecognized transfer-coding is
+        // received, the server SHOULD return 501 Not Implemented.
+        if (te != null and !Headers.eqlIgnoreCase(te.?, "chunked") and
+            !Headers.eqlIgnoreCase(te.?, "identity"))
+        {
+            const resp: Response = .{ .status = .not_implemented, .body = "Unsupported Transfer-Encoding" };
+            var resp_buf: [Response.max_response_len]u8 = undefined;
+            const resp_data = resp.serialize(&resp_buf) catch return;
+            net_writer.interface.writeAll(resp_data) catch return;
+            net_writer.interface.flush() catch return;
+            return;
+        }
+
         if (te != null and Headers.eqlIgnoreCase(te.?, "chunked")) {
             // RFC 2616 Section 3.6.1: Read chunked body from stream.
             // Read chunk lines until we see the terminating "0\r\n...\r\n"
@@ -126,6 +155,8 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 error.UnknownMethod => .not_implemented,
                 error.InvalidVersion => .http_version_not_supported,
                 error.MissingHostHeader => .bad_request,
+                error.MultipleHostHeaders => .bad_request,
+                error.ConflictingContentLength => .bad_request,
                 error.LineTooLong => .request_uri_too_long,
                 error.BodyTooLarge => .request_entity_too_large,
                 error.InvalidContentLength => .bad_request,
@@ -147,7 +178,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         // Process the request
         const timestamp = Date.now(io);
-        var response = Connection.processRequest(timestamp, &request, self.handler);
+        var response = Connection.processRequest(timestamp, &request, self.handler, io);
 
         // RFC 2616 Section 14.45: Add Via header for proxied responses.
         if (self.config.enable_proxy) {
@@ -427,6 +458,17 @@ fn extractHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// RFC 2616 Section 8.1.4: Set SO_RCVTIMEO on a socket to enforce
+/// idle connection timeouts. When the timeout expires, reads return
+/// an error and the connection is closed.
+fn setSocketTimeout(handle: Io.net.Socket.Handle, timeout_s: u32) void {
+    const timeval = std.posix.timeval{
+        .sec = @intCast(timeout_s),
+        .usec = 0,
+    };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+}
+
 fn asciiLowerLine(input: []const u8) [16]u8 {
     var result: [16]u8 = undefined;
     for (input, 0..) |c, i| {
@@ -473,7 +515,7 @@ test "Server: extractContentLength missing" {
 // /// Server init
 test "Server: init" {
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: Io) Response {
             return Response.init(.ok, "text/plain", "OK");
         }
     }.handle;

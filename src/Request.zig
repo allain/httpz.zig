@@ -70,6 +70,9 @@ uri: []const u8 = "/",
 version: Version = .http_1_1,
 headers: Headers = .{},
 body: []const u8 = "",
+/// Raw request bytes (request-line + headers + terminator).
+/// Used by TRACE to echo the received message (RFC 2616 §9.8).
+raw: []const u8 = "",
 
 pub const max_request_line_len = 8192;
 pub const max_header_line_len = 8192;
@@ -96,6 +99,10 @@ pub const ParseError = error{
     UnexpectedEndOfInput,
     /// Too many headers
     TooManyHeaders,
+    /// RFC 2616 Section 14.23: Multiple Host headers
+    MultipleHostHeaders,
+    /// RFC 2616 Section 4.4: Multiple conflicting Content-Length headers
+    ConflictingContentLength,
 };
 
 /// Parse a complete HTTP/1.1 request from raw bytes.
@@ -105,7 +112,7 @@ pub const ParseError = error{
 ///   *(header-field CRLF)
 ///   CRLF
 ///   [message-body]
-pub fn parse(data: []const u8) ParseError!Request {
+pub fn parse(data: []u8) ParseError!Request {
     var request: Request = .{};
     var pos: usize = 0;
 
@@ -139,14 +146,23 @@ pub fn parse(data: []const u8) ParseError!Request {
 
         // RFC 2616 Section 4.2: Header continuation lines start with SP or HTAB.
         // LWS at start of line means this is a continuation of the previous header.
-        // We unfold by extending the previous header's value slice to include
-        // the continuation (both are slices into the same data buffer).
+        // We unfold by replacing the CRLF between lines with SP (in-place) and
+        // extending the previous header's value slice.
         if (header_line.len > 0 and (header_line[0] == ' ' or header_line[0] == '\t')) {
             if (request.headers.len > 0) {
                 const prev = &request.headers.entries[request.headers.len - 1];
-                // Extend the value slice to cover from original start through
-                // the end of this continuation line (including the \r\n gap,
-                // which is treated as linear whitespace per RFC 2616 §2.2).
+                // Replace the CRLF before this continuation line with spaces.
+                // The CRLF sits at (header_line.ptr - 2) in the mutable buffer.
+                // The data buffer is mutable ([]u8), so we can modify the
+                // CRLF bytes that sit right before this continuation line.
+                const line_start = @intFromPtr(header_line.ptr);
+                const data_start = @intFromPtr(data.ptr);
+                const line_offset = line_start - data_start;
+                if (line_offset >= 2) {
+                    data[line_offset - 2] = ' ';
+                    data[line_offset - 1] = ' ';
+                }
+                // Extend the value slice through the continuation.
                 const start = @intFromPtr(prev.value.ptr);
                 const end = @intFromPtr(header_line.ptr) + header_line.len;
                 prev.value = @as([*]const u8, @ptrFromInt(start))[0 .. end - start];
@@ -159,11 +175,23 @@ pub fn parse(data: []const u8) ParseError!Request {
 
     if (!found_end_of_headers) return error.UnexpectedEndOfInput;
 
-    // RFC 2616 Section 5.2: If the Request-URI is an absoluteURI, the host
-    // is taken from the URI itself. The Host header, if present, is ignored
-    // in favor of the URI host. If Host is missing, extract from URI.
-    if (request.version == .http_1_1 and request.headers.get("Host") == null) {
-        if (!extractHostFromAbsoluteUri(&request)) {
+    // Store raw request (request-line + headers + blank line) for TRACE echo.
+    request.raw = data[0..pos];
+
+    // RFC 2616 Section 14.23: HTTP/1.1 requests MUST include exactly one
+    // Host header. Multiple Host headers MUST be rejected with 400.
+    if (request.version == .http_1_1) {
+        var host_buf: [2][]const u8 = undefined;
+        const host_count = request.headers.getAll("Host", &host_buf);
+        if (host_count > 1) return error.MultipleHostHeaders;
+
+        // RFC 2616 Section 5.2: If the Request-URI is an absoluteURI, the
+        // host is part of the Request-URI. Any Host header field value MUST
+        // be ignored in favor of the URI's host.
+        if (extractHostFromAbsoluteUri(&request)) {
+            // Host extracted from absolute URI; remove any existing Host header
+            // and use the URI's host instead (already appended by extract fn).
+        } else if (host_count == 0) {
             return error.MissingHostHeader;
         }
     }
@@ -177,6 +205,13 @@ pub fn parse(data: []const u8) ParseError!Request {
         // The server is responsible for calling parseChunkedBody on a mutable buffer.
         request.body = data[pos..];
     } else if (request.headers.get("Content-Length")) |cl_str| {
+        // RFC 2616 Section 4.4: Multiple Content-Length headers with
+        // differing values indicate an invalid message (request smuggling risk).
+        var cl_vals: [2][]const u8 = undefined;
+        const cl_count = request.headers.getAll("Content-Length", &cl_vals);
+        if (cl_count > 1 and !std.mem.eql(u8, trimOws(cl_vals[0]), trimOws(cl_vals[1]))) {
+            return error.ConflictingContentLength;
+        }
         const content_length = std.fmt.parseInt(usize, trimOws(cl_str), 10) catch
             return error.InvalidContentLength;
         if (content_length > max_body_len) return error.BodyTooLarge;
@@ -274,8 +309,8 @@ pub fn acceptsEncoding(self: *const Request, encoding: []const u8) bool {
     return std.mem.indexOf(u8, ae, encoding) != null;
 }
 
-/// RFC 2616 Section 5.2: Extract host from an absolute URI and add it
-/// as a Host header. Returns true if a host was found and added.
+/// RFC 2616 Section 5.2: Extract host from an absolute URI and replace
+/// any existing Host header. Returns true if a host was found.
 fn extractHostFromAbsoluteUri(request: *Request) bool {
     const uri = request.uri;
     // Look for "://" scheme separator
@@ -285,6 +320,8 @@ fn extractHostFromAbsoluteUri(request: *Request) bool {
     const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
     const host = after_scheme[0..host_end];
     if (host.len == 0) return false;
+    // Remove any existing Host header; the absolute URI takes precedence.
+    request.headers.remove("Host");
     request.headers.append("Host", host) catch return false;
     return true;
 }
@@ -292,9 +329,13 @@ fn extractHostFromAbsoluteUri(request: *Request) bool {
 /// RFC 2616 Section 14.25: Check if the resource has been modified since
 /// the date in the `If-Modified-Since` header. Returns true if the
 /// resource has NOT been modified (i.e., a 304 should be returned).
+///
+/// Accepts all three HTTP date formats per RFC 2616 Section 3.3.1.
+/// Note: Per RFC 2616 Section 14.25, if If-None-Match is also present,
+/// If-Modified-Since MUST be ignored. Callers should check matchesEtag first.
 pub fn isNotModifiedSince(self: *const Request, resource_timestamp: i64) bool {
     const ims = self.headers.get("If-Modified-Since") orelse return false;
-    const ims_timestamp = Date.parseRfc1123(ims) orelse return false;
+    const ims_timestamp = Date.parseHttpDate(ims) orelse return false;
     return resource_timestamp <= ims_timestamp;
 }
 
@@ -342,12 +383,20 @@ pub fn parseRange(self: *const Request, total_size: usize) ?ByteRange {
 
 /// RFC 2616 Section 14.26: Check If-None-Match against an ETag.
 /// Returns true if the request ETag matches (resource not modified).
+/// Handles comma-separated ETag lists: `If-None-Match: "a", "b", "c"`
+///
+/// RFC 2616 Section 14.25: If If-None-Match is present, If-Modified-Since
+/// MUST be ignored. Callers should check matchesEtag first.
 pub fn matchesEtag(self: *const Request, etag: []const u8) bool {
     const inm = self.headers.get("If-None-Match") orelse return false;
     // Wildcard match
     if (std.mem.eql(u8, trimOws(inm), "*")) return true;
-    // Simple comparison (doesn't handle comma-separated lists)
-    return std.mem.eql(u8, trimOws(inm), etag);
+    // Check each comma-separated ETag
+    var it = std.mem.splitScalar(u8, inm, ',');
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, trimOws(part), etag)) return true;
+    }
+    return false;
 }
 
 /// RFC 2616 Section 3.7.2: A multipart body part.
@@ -553,6 +602,19 @@ pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!ChunkedResult {
     }
 }
 
+/// Parse from a const slice. This copies into an internal buffer first
+/// so the parse can do in-place modifications (header continuation folding).
+/// Primarily useful for tests. Production code should use `parse()` with
+/// a mutable buffer.
+pub fn parseConst(data: []const u8) ParseError!Request {
+    const S = struct {
+        threadlocal var buf: [max_request_line_len + max_header_line_len * Headers.max_headers + max_body_len]u8 = undefined;
+    };
+    if (data.len > S.buf.len) return error.BodyTooLarge;
+    @memcpy(S.buf[0..data.len], data);
+    return parse(S.buf[0..data.len]);
+}
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -594,7 +656,7 @@ test "Request: parse simple GET request" {
         "Accept: text/html\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.GET, req.method);
     try testing.expectEqualStrings("/index.html", req.uri);
     try testing.expectEqual(Version.http_1_1, req.version);
@@ -612,7 +674,7 @@ test "Request: parse POST request with body" {
         "\r\n" ++
         "hello=world";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.POST, req.method);
     try testing.expectEqualStrings("/submit", req.uri);
     try testing.expectEqualStrings("hello=world", req.body);
@@ -627,7 +689,7 @@ test "Request: ignore leading CRLF" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.GET, req.method);
     try testing.expectEqualStrings("/", req.uri);
 }
@@ -640,7 +702,7 @@ test "Request: missing Host header in HTTP/1.1 returns error" {
         "Accept: */*\r\n" ++
         "\r\n";
 
-    try testing.expectError(error.MissingHostHeader, Request.parse(raw));
+    try testing.expectError(error.MissingHostHeader, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 14.23: HTTP/1.0 requests don't require Host.
@@ -649,14 +711,14 @@ test "Request: HTTP/1.0 without Host is valid" {
         "GET / HTTP/1.0\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Version.http_1_0, req.version);
 }
 
 // /// RFC 2616 Section 5.1: Invalid request line
 test "Request: invalid request line" {
-    try testing.expectError(error.InvalidRequestLine, Request.parse("GET\r\n\r\n"));
-    try testing.expectError(error.InvalidRequestLine, Request.parse("GET /\r\n\r\n"));
+    try testing.expectError(error.InvalidRequestLine, Request.parseConst("GET\r\n\r\n"));
+    try testing.expectError(error.InvalidRequestLine, Request.parseConst("GET /\r\n\r\n"));
 }
 
 // /// RFC 2616 Section 5.1.1: Unknown method
@@ -665,7 +727,7 @@ test "Request: unknown method" {
         "FROBNICATE / HTTP/1.1\r\n" ++
         "Host: example.com\r\n" ++
         "\r\n";
-    try testing.expectError(error.UnknownMethod, Request.parse(raw));
+    try testing.expectError(error.UnknownMethod, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 3.1: Invalid HTTP version
@@ -674,7 +736,7 @@ test "Request: invalid version" {
         "GET / HTTP/2.0\r\n" ++
         "Host: example.com\r\n" ++
         "\r\n";
-    try testing.expectError(error.InvalidVersion, Request.parse(raw));
+    try testing.expectError(error.InvalidVersion, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 4.2: Header with optional whitespace around value
@@ -684,7 +746,7 @@ test "Request: header value whitespace trimming" {
         "Host:   example.com  \r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("example.com", req.headers.get("Host").?);
 }
 
@@ -694,7 +756,7 @@ test "Request: malformed header" {
         "GET / HTTP/1.1\r\n" ++
         "Host example.com\r\n" ++
         "\r\n";
-    try testing.expectError(error.InvalidHeader, Request.parse(raw));
+    try testing.expectError(error.InvalidHeader, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 4.4: Invalid Content-Length value
@@ -704,7 +766,7 @@ test "Request: invalid content-length" {
         "Host: example.com\r\n" ++
         "Content-Length: abc\r\n" ++
         "\r\n";
-    try testing.expectError(error.InvalidContentLength, Request.parse(raw));
+    try testing.expectError(error.InvalidContentLength, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 4.4: Content-Length exceeds body data
@@ -715,12 +777,12 @@ test "Request: content-length exceeds available data" {
         "Content-Length: 100\r\n" ++
         "\r\n" ++
         "short";
-    try testing.expectError(error.UnexpectedEndOfInput, Request.parse(raw));
+    try testing.expectError(error.UnexpectedEndOfInput, Request.parseConst(raw));
 }
 
 // /// RFC 2616 Section 5: Unexpected end of input
 test "Request: unexpected end of input" {
-    try testing.expectError(error.UnexpectedEndOfInput, Request.parse("GET / HTTP/1.1\r\n"));
+    try testing.expectError(error.UnexpectedEndOfInput, Request.parseConst("GET / HTTP/1.1\r\n"));
 }
 
 // /// RFC 2616 Section 5.1: Request-URI with query string
@@ -730,7 +792,7 @@ test "Request: URI with query string" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("/search?q=test&page=1", req.uri);
 }
 
@@ -741,7 +803,7 @@ test "Request: absolute URI" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("http://example.com/path", req.uri);
 }
 
@@ -752,7 +814,7 @@ test "Request: OPTIONS with asterisk URI" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.OPTIONS, req.method);
     try testing.expectEqualStrings("*", req.uri);
 }
@@ -831,7 +893,7 @@ test "Request: HEAD request" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.HEAD, req.method);
     try testing.expectEqualStrings("/resource", req.uri);
 }
@@ -845,7 +907,7 @@ test "Request: PUT request with body" {
         "\r\n" ++
         "Hello, World!";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.PUT, req.method);
     try testing.expectEqualStrings("Hello, World!", req.body);
 }
@@ -857,7 +919,7 @@ test "Request: DELETE request" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqual(Method.DELETE, req.method);
     try testing.expectEqualStrings("/resource/42", req.uri);
 }
@@ -872,7 +934,7 @@ test "Request: Transfer-Encoding precedence over Content-Length" {
         "\r\n" ++
         "5\r\nHello\r\n0\r\n\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     // Body should contain the raw chunked data, not 999 bytes
     try testing.expect(req.body.len > 0);
     try testing.expect(req.body.len < 999);
@@ -888,7 +950,7 @@ test "Request: Transfer-Encoding identity uses Content-Length" {
         "\r\n" ++
         "Hello";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("Hello", req.body);
 }
 
@@ -901,7 +963,7 @@ test "Request: header continuation line" {
         " continued-value\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const val = req.headers.get("X-Long-Header").?;
     // The folded value should contain both parts
     try testing.expect(std.mem.indexOf(u8, val, "value1") != null);
@@ -917,7 +979,7 @@ test "Request: header continuation with tab" {
         "\tsecond\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const val = req.headers.get("X-Header").?;
     try testing.expect(std.mem.indexOf(u8, val, "first") != null);
     try testing.expect(std.mem.indexOf(u8, val, "second") != null);
@@ -931,7 +993,7 @@ test "Request: isNotModifiedSince returns true when not modified" {
         "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     // Resource modified at epoch (same time) - not modified
     try testing.expect(req.isNotModifiedSince(0));
     // Resource modified before the date - not modified
@@ -946,7 +1008,7 @@ test "Request: isNotModifiedSince returns false when modified" {
         "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     // Resource modified after the date - modified
     try testing.expect(!req.isNotModifiedSince(1));
 }
@@ -958,7 +1020,7 @@ test "Request: isNotModifiedSince returns false when header absent" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(!req.isNotModifiedSince(0));
 }
 
@@ -970,7 +1032,7 @@ test "Request: matchesEtag" {
         "If-None-Match: \"abc123\"\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.matchesEtag("\"abc123\""));
     try testing.expect(!req.matchesEtag("\"def456\""));
 }
@@ -983,7 +1045,7 @@ test "Request: matchesEtag wildcard" {
         "If-None-Match: *\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.matchesEtag("\"anything\""));
 }
 
@@ -995,7 +1057,7 @@ test "Request: accepts content type" {
         "Accept: text/html, application/json\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.accepts("text/html"));
     try testing.expect(req.accepts("application/json"));
     try testing.expect(!req.accepts("image/png"));
@@ -1009,7 +1071,7 @@ test "Request: accepts wildcard" {
         "Accept: */*\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.accepts("text/html"));
     try testing.expect(req.accepts("application/json"));
 }
@@ -1022,7 +1084,7 @@ test "Request: accepts type wildcard" {
         "Accept: text/*\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.accepts("text/html"));
     try testing.expect(req.accepts("text/plain"));
     try testing.expect(!req.accepts("application/json"));
@@ -1035,7 +1097,7 @@ test "Request: accepts without header" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.accepts("anything/at-all"));
 }
 
@@ -1047,7 +1109,7 @@ test "Request: acceptsEncoding" {
         "Accept-Encoding: gzip, deflate\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.acceptsEncoding("gzip"));
     try testing.expect(req.acceptsEncoding("deflate"));
     try testing.expect(!req.acceptsEncoding("br"));
@@ -1061,7 +1123,7 @@ test "Request: parseRange simple" {
         "Range: bytes=0-499\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const range = req.parseRange(1000).?;
     try testing.expectEqual(@as(usize, 0), range.start.?);
     try testing.expectEqual(@as(usize, 499), range.end.?);
@@ -1075,7 +1137,7 @@ test "Request: parseRange suffix" {
         "Range: bytes=-500\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const range = req.parseRange(1000).?;
     try testing.expectEqual(@as(usize, 500), range.start.?);
     try testing.expectEqual(@as(usize, 999), range.end.?);
@@ -1089,7 +1151,7 @@ test "Request: parseRange open-ended" {
         "Range: bytes=500-\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const range = req.parseRange(1000).?;
     try testing.expectEqual(@as(usize, 500), range.start.?);
     try testing.expectEqual(@as(usize, 999), range.end.?);
@@ -1102,7 +1164,7 @@ test "Request: parseRange no header" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.parseRange(1000) == null);
 }
 
@@ -1114,7 +1176,7 @@ test "Request: parseRange out of bounds" {
         "Range: bytes=2000-3000\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expect(req.parseRange(1000) == null);
 }
 
@@ -1126,7 +1188,7 @@ test "Request: parseRange end clamped" {
         "Range: bytes=500-5000\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     const range = req.parseRange(1000).?;
     try testing.expectEqual(@as(usize, 500), range.start.?);
     try testing.expectEqual(@as(usize, 999), range.end.?);
@@ -1138,7 +1200,7 @@ test "Request: absolute URI provides Host header" {
         "GET http://example.com/path HTTP/1.1\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("example.com", req.headers.get("Host").?);
 }
 
@@ -1148,7 +1210,7 @@ test "Request: absolute URI with port provides Host" {
         "GET http://example.com:8080/path HTTP/1.1\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("example.com:8080", req.headers.get("Host").?);
 }
 
@@ -1174,7 +1236,7 @@ test "Request: parseMultipart simple" {
         "\r\n" ++
         body;
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     var parts: [4]MultipartPart = undefined;
     const count = req.parseMultipart(&parts).?;
     try testing.expectEqual(@as(usize, 2), count);
@@ -1190,7 +1252,7 @@ test "Request: parseMultipart no content type" {
         "Host: example.com\r\n" ++
         "\r\n";
 
-    const req = try Request.parse(raw);
+    const req = try Request.parseConst(raw);
     var parts: [4]MultipartPart = undefined;
     try testing.expect(req.parseMultipart(&parts) == null);
 }
@@ -1208,5 +1270,86 @@ test "Request: empty URI rejected" {
         "GET  HTTP/1.1\r\n" ++
         "Host: example.com\r\n" ++
         "\r\n";
-    try testing.expectError(error.InvalidRequestLine, Request.parse(raw));
+    try testing.expectError(error.InvalidRequestLine, Request.parseConst(raw));
+}
+
+// RFC 2616 Section 14.23: Multiple Host headers MUST be rejected.
+test "Request: multiple Host headers rejected" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Host: other.com\r\n" ++
+        "\r\n";
+    try testing.expectError(error.MultipleHostHeaders, Request.parseConst(raw));
+}
+
+// RFC 2616 Section 4.4: Conflicting Content-Length headers rejected.
+test "Request: conflicting Content-Length rejected" {
+    const raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        "hello";
+    try testing.expectError(error.ConflictingContentLength, Request.parseConst(raw));
+}
+
+// RFC 2616 Section 4.4: Identical Content-Length headers are accepted.
+test "Request: identical Content-Length accepted" {
+    const raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("hello", req.body);
+}
+
+// RFC 2616 Section 5.2: Absolute URI host takes precedence over Host header.
+test "Request: absolute URI host overrides Host header" {
+    const raw =
+        "GET http://proxy-target.com/path HTTP/1.1\r\n" ++
+        "Host: original-host.com\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("proxy-target.com", req.headers.get("Host").?);
+}
+
+// RFC 2616 Section 14.26: If-None-Match with comma-separated ETags.
+test "Request: matchesEtag comma-separated list" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "If-None-Match: \"aaa\", \"bbb\", \"ccc\"\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expect(req.matchesEtag("\"bbb\""));
+    try testing.expect(!req.matchesEtag("\"ddd\""));
+}
+
+// RFC 2616 Section 3.3.1: isNotModifiedSince accepts RFC 850 format.
+test "Request: isNotModifiedSince RFC 850 date" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    // 784111777 = Sun, 06 Nov 1994 08:49:37 GMT
+    try testing.expect(req.isNotModifiedSince(784111777));
+    try testing.expect(!req.isNotModifiedSince(784111778));
+}
+
+// RFC 2616 Section 3.3.1: isNotModifiedSince accepts asctime format.
+test "Request: isNotModifiedSince asctime date" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "If-Modified-Since: Sun Nov  6 08:49:37 1994\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expect(req.isNotModifiedSince(784111777));
 }

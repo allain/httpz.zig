@@ -102,11 +102,19 @@ fn writeDecimal4(buf: *[4]u8, val: u16) void {
     buf[3] = '0' + @as(u8, @intCast(val % 10));
 }
 
+/// Parse an HTTP-date string to a Unix timestamp.
+///
+/// RFC 2616 Section 3.3.1: HTTP/1.1 clients and servers MUST accept all
+/// three date formats:
+///   RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
+///   RFC 850:  "Sunday, 06-Nov-94 08:49:37 GMT"
+///   asctime:  "Sun Nov  6 08:49:37 1994"
+pub fn parseHttpDate(s: []const u8) ?i64 {
+    return parseRfc1123(s) orelse parseRfc850(s) orelse parseAsctime(s);
+}
+
 /// Parse an RFC 1123 date string to a Unix timestamp.
 /// Format: "Sun, 06 Nov 1994 08:49:37 GMT"
-///
-/// RFC 2616 Section 3.3.1: HTTP applications have historically allowed
-/// three different formats for dates. For parsing, we support RFC 1123.
 pub fn parseRfc1123(s: []const u8) ?i64 {
     if (s.len != 29) return null;
 
@@ -119,11 +127,73 @@ pub fn parseRfc1123(s: []const u8) ?i64 {
     const minutes = parseDecimal2(s[20..22]) orelse return null;
     const seconds = parseDecimal2(s[23..25]) orelse return null;
 
+    return toTimestamp(year, month, day, hours, minutes, seconds);
+}
+
+/// Parse an RFC 850 date string to a Unix timestamp.
+/// Format: "Sunday, 06-Nov-94 08:49:37 GMT"
+/// The day name has variable length (e.g., "Monday" vs "Sun").
+pub fn parseRfc850(s: []const u8) ?i64 {
+    // Find the comma that follows the day name
+    const comma = std.mem.indexOfScalar(u8, s, ',') orelse return null;
+    if (comma + 2 >= s.len) return null;
+    // After "dayname, " expect "DD-Mon-YY HH:MM:SS GMT" (22 chars)
+    const rest = s[comma + 2 ..];
+    if (rest.len != 22) return null;
+
+    // "06-Nov-94 08:49:37 GMT"
+    //  0123456789012345678901
+    const day = parseDecimal2(rest[0..2]) orelse return null;
+    if (rest[2] != '-') return null;
+    const month = parseMonth(rest[3..6]) orelse return null;
+    if (rest[6] != '-') return null;
+    const year2 = parseDecimal2(rest[7..9]) orelse return null;
+    // RFC 2616 Section 19.3: Two-digit years. Values >= 70 are 19xx.
+    const year: u16 = if (year2 >= 70) 1900 + @as(u16, year2) else 2000 + @as(u16, year2);
+    if (rest[9] != ' ') return null;
+    const hours = parseDecimal2(rest[10..12]) orelse return null;
+    if (rest[12] != ':') return null;
+    const minutes = parseDecimal2(rest[13..15]) orelse return null;
+    if (rest[15] != ':') return null;
+    const seconds = parseDecimal2(rest[16..18]) orelse return null;
+
+    return toTimestamp(year, month, day, hours, minutes, seconds);
+}
+
+/// Parse an asctime() date string to a Unix timestamp.
+/// Format: "Sun Nov  6 08:49:37 1994"
+pub fn parseAsctime(s: []const u8) ?i64 {
+    if (s.len != 24) return null;
+
+    // "Sun Nov  6 08:49:37 1994"
+    //  0123456789...
+    const month = parseMonth(s[4..7]) orelse return null;
+    if (s[7] != ' ') return null;
+    // Day may be space-padded: " 6" or "10"
+    const day: u8 = if (s[8] == ' ')
+        std.fmt.charToDigit(s[9], 10) catch return null
+    else
+        (std.fmt.charToDigit(s[8], 10) catch return null) * 10 +
+            (std.fmt.charToDigit(s[9], 10) catch return null);
+    if (s[10] != ' ') return null;
+    const hours = parseDecimal2(s[11..13]) orelse return null;
+    if (s[13] != ':') return null;
+    const minutes = parseDecimal2(s[14..16]) orelse return null;
+    if (s[16] != ':') return null;
+    const seconds = parseDecimal2(s[17..19]) orelse return null;
+    if (s[19] != ' ') return null;
+    const year = parseDecimal4(s[20..24]) orelse return null;
+
+    return toTimestamp(year, month, day, hours, minutes, seconds);
+}
+
+/// Convert year/month/day/time components to a Unix timestamp.
+/// Returns null if any component is out of range.
+fn toTimestamp(year: u16, month: u8, day: u8, hours: u8, minutes: u8, seconds: u8) ?i64 {
     if (hours > 23 or minutes > 59 or seconds > 59) return null;
     if (day < 1 or day > 31 or month < 1 or month > 12) return null;
     if (year < 1970) return null;
 
-    // Convert to days since epoch using inverse of Hinnant's algorithm
     const days = ymdToDays(year, month, day);
     return @as(i64, @intCast(days)) * 86400 +
         @as(i64, hours) * 3600 +
@@ -235,6 +305,71 @@ test "Date: parse invalid date" {
     try testing.expect(parseRfc1123("not a date") == null);
     try testing.expect(parseRfc1123("") == null);
     try testing.expect(parseRfc1123("Thu, 01 Xyz 1970 00:00:00 GMT") == null);
+}
+
+// RFC 2616 Section 3.3.1: Parse RFC 850 date format
+test "Date: parse RFC 850 format" {
+    // Sunday, 06-Nov-94 08:49:37 GMT = 784111777
+    const ts = parseRfc850("Sunday, 06-Nov-94 08:49:37 GMT");
+    try testing.expectEqual(@as(i64, 784111777), ts.?);
+}
+
+// RFC 850 with short day name
+test "Date: parse RFC 850 short day" {
+    const ts = parseRfc850("Thu, 01-Jan-70 00:00:00 GMT");
+    try testing.expectEqual(@as(i64, 0), ts.?);
+}
+
+// RFC 850 with year >= 70 (1900s)
+test "Date: parse RFC 850 year mapping" {
+    // Year 94 -> 1994, Year 00 -> 2000
+    const ts94 = parseRfc850("Sunday, 06-Nov-94 08:49:37 GMT");
+    try testing.expect(ts94 != null);
+    const ts00 = parseRfc850("Saturday, 01-Jan-00 00:00:00 GMT");
+    try testing.expectEqual(@as(i64, 946684800), ts00.?);
+}
+
+// RFC 850 invalid
+test "Date: parse RFC 850 invalid" {
+    try testing.expect(parseRfc850("not a date") == null);
+    try testing.expect(parseRfc850("") == null);
+}
+
+// asctime format
+test "Date: parse asctime format" {
+    // "Sun Nov  6 08:49:37 1994" = 784111777
+    const ts = parseAsctime("Sun Nov  6 08:49:37 1994");
+    try testing.expectEqual(@as(i64, 784111777), ts.?);
+}
+
+// asctime with two-digit day
+test "Date: parse asctime two-digit day" {
+    // "Thu Jan  1 00:00:00 1970" = 0
+    const ts = parseAsctime("Thu Jan  1 00:00:00 1970");
+    try testing.expectEqual(@as(i64, 0), ts.?);
+}
+
+test "Date: parse asctime double-digit day" {
+    const ts = parseAsctime("Sat Jan 15 12:00:00 2000");
+    try testing.expect(ts != null);
+}
+
+// asctime invalid
+test "Date: parse asctime invalid" {
+    try testing.expect(parseAsctime("not a date at all!!!!!") == null);
+    try testing.expect(parseAsctime("") == null);
+}
+
+// parseHttpDate accepts all three formats
+test "Date: parseHttpDate all formats" {
+    // RFC 1123
+    try testing.expectEqual(@as(i64, 784111777), parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT").?);
+    // RFC 850
+    try testing.expectEqual(@as(i64, 784111777), parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT").?);
+    // asctime
+    try testing.expectEqual(@as(i64, 784111777), parseHttpDate("Sun Nov  6 08:49:37 1994").?);
+    // invalid
+    try testing.expect(parseHttpDate("not a date") == null);
 }
 
 // Edge case: end of day

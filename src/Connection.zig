@@ -13,7 +13,7 @@ const Date = @import("Date.zig");
 /// HTTP/1.0 connections are non-persistent by default unless
 /// "Connection: keep-alive" is explicitly specified.
 
-pub const Handler = *const fn (*const Request) Response;
+pub const Handler = *const fn (*const Request, std.Io) Response;
 
 /// RFC 2616 Section 8.1.2: Overall Operation
 /// Determine if the connection should be kept alive.
@@ -45,13 +45,15 @@ pub fn shouldKeepAlive(request: *const Request) bool {
 /// supported by the resource. Used in OPTIONS and 405 responses.
 pub const default_allow = "GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE, PATCH";
 
-pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler) Response {
+pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler, io: std.Io) Response {
     // RFC 2616 Section 9.8: TRACE method echoes the request.
     if (request.method == .TRACE) {
-        return handleTrace(request);
+        var response = handleTrace(request);
+        addStandardHeaders(&response, timestamp, request);
+        return response;
     }
 
-    var response = handler(request);
+    var response = handler(request, io);
 
     // RFC 2616 Section 10.4.6: 405 responses MUST include an Allow header.
     if (response.status == .method_not_allowed and response.headers.get("Allow") == null) {
@@ -63,28 +65,23 @@ pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler)
         response.headers.append("WWW-Authenticate", "Basic realm=\"httpz\"") catch {};
     }
 
-    // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
-    if (response.headers.get("Date") == null) {
-        const S = struct {
-            threadlocal var date_buf: [29]u8 = undefined;
-        };
-        _ = Date.formatRfc1123(timestamp, &S.date_buf);
-        response.headers.append("Date", &S.date_buf) catch {};
+    // RFC 2616 Section 10.2.2: 201 responses SHOULD include a Location header.
+    // RFC 2616 Section 10.3.x: Redirect responses MUST include a Location header.
+    if (isRedirect(response.status) and response.headers.get("Location") == null) {
+        response.headers.append("Location", "/") catch {};
     }
 
-    // RFC 2616 Section 14.38: Server header.
-    if (response.headers.get("Server") == null) {
-        response.headers.append("Server", "httpz/0.1") catch {};
-    }
+    addStandardHeaders(&response, timestamp, request);
 
     // RFC 2616 Section 9.2: OPTIONS responses should include Allow header.
     if (request.method == .OPTIONS and response.headers.get("Allow") == null) {
         response.headers.append("Allow", default_allow) catch {};
     }
 
-    // RFC 2616 Section 13.5.1: Remove hop-by-hop headers from the response.
-    // These headers are meaningful only for a single transport-level connection.
-    removeHopByHopHeaders(&response.headers);
+    // RFC 2616 Section 13.5.1 / 14.10: Remove hop-by-hop headers from the
+    // response. Also parse the Connection header for additional hop-by-hop
+    // header names specified by the client.
+    removeHopByHopHeaders(&response.headers, request);
 
     // RFC 2616 Section 8.1.2.1: Connection header.
     if (!shouldKeepAlive(request)) {
@@ -99,64 +96,49 @@ pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler)
     // RFC 2616 Section 3.1: Respond with HTTP/1.0 to HTTP/1.0 clients.
     if (request.version == .http_1_0) {
         response.version = .http_1_0;
+        // RFC 2616 Section 3.6: MUST NOT send Transfer-Encoding to HTTP/1.0 clients.
+        if (response.chunked) {
+            response.chunked = false;
+            response.auto_content_length = true;
+        }
     }
 
-    // RFC 2616 Section 14.13: Content-Length is auto-generated during
-    // serialization by Response.serialize() for known body sizes.
     // RFC 2616 Section 4.3: Responses to body-forbidden status codes
-    // should not include Content-Length.
+    // MUST NOT include a message body.
     if (isBodyForbidden(response.status)) {
         response.auto_content_length = false;
+        response.strip_body = true;
+        response.body = "";
     }
 
     return response;
 }
 
-/// RFC 2616 Section 9.8: The TRACE method requests that the server
-/// echo the received request message back to the client.
-///
-/// Note: The TRACE echo body is stored in a thread-local buffer so it
-/// remains valid until the next TRACE call on the same thread.
-fn handleTrace(request: *const Request) Response {
-    const S = struct {
-        threadlocal var body_buf: [Request.max_request_line_len + Request.max_header_line_len * Headers.max_headers]u8 = undefined;
-    };
-
-    var pos: usize = 0;
-
-    // Request-Line
-    const method = request.method.toBytes();
-    @memcpy(S.body_buf[pos..][0..method.len], method);
-    pos += method.len;
-    S.body_buf[pos] = ' ';
-    pos += 1;
-    @memcpy(S.body_buf[pos..][0..request.uri.len], request.uri);
-    pos += request.uri.len;
-    S.body_buf[pos] = ' ';
-    pos += 1;
-    const ver = request.version.toBytes();
-    @memcpy(S.body_buf[pos..][0..ver.len], ver);
-    pos += ver.len;
-    @memcpy(S.body_buf[pos..][0..2], "\r\n");
-    pos += 2;
-
-    // Headers
-    for (request.headers.entries[0..request.headers.len]) |entry| {
-        @memcpy(S.body_buf[pos..][0..entry.name.len], entry.name);
-        pos += entry.name.len;
-        @memcpy(S.body_buf[pos..][0..2], ": ");
-        pos += 2;
-        @memcpy(S.body_buf[pos..][0..entry.value.len], entry.value);
-        pos += entry.value.len;
-        @memcpy(S.body_buf[pos..][0..2], "\r\n");
-        pos += 2;
+/// Add Date and Server headers common to all responses including TRACE.
+fn addStandardHeaders(response: *Response, timestamp: i64, request: *const Request) void {
+    _ = request;
+    // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
+    if (response.headers.get("Date") == null) {
+        const S = struct {
+            threadlocal var date_buf: [29]u8 = undefined;
+        };
+        _ = Date.formatRfc1123(timestamp, &S.date_buf);
+        response.headers.append("Date", &S.date_buf) catch {};
     }
-    @memcpy(S.body_buf[pos..][0..2], "\r\n");
-    pos += 2;
 
+    // RFC 2616 Section 14.38: Server header.
+    if (response.headers.get("Server") == null) {
+        response.headers.append("Server", "httpz/0.1") catch {};
+    }
+}
+
+/// RFC 2616 Section 9.8: The TRACE method requests that the server
+/// echo the received request message back to the client. The response
+/// body contains the raw request message as received by the server.
+fn handleTrace(request: *const Request) Response {
     var response: Response = .{
         .status = .ok,
-        .body = S.body_buf[0..pos],
+        .body = request.raw,
     };
     response.headers.append("Content-Type", "message/http") catch {};
 
@@ -167,19 +149,35 @@ fn handleTrace(request: *const Request) Response {
 /// forwarded. These are meaningful only for a single transport-level
 /// connection and should not be stored by caches or forwarded by proxies.
 ///
-/// Note: Connection and Transfer-Encoding are managed by the server itself,
-/// so we only strip headers that a user handler might accidentally set.
-fn removeHopByHopHeaders(headers: *Headers) void {
+/// RFC 2616 Section 14.10: The Connection header may list additional
+/// hop-by-hop headers that must also be removed.
+fn removeHopByHopHeaders(headers: *Headers, request: *const Request) void {
     const hop_by_hop = [_][]const u8{
         "Keep-Alive",
         "Proxy-Authenticate",
         "Proxy-Authorization",
         "TE",
         "Trailers",
+        "Transfer-Encoding",
         "Upgrade",
     };
     for (hop_by_hop) |name| {
         headers.remove(name);
+    }
+
+    // RFC 2616 Section 14.10: Parse Connection header for additional
+    // hop-by-hop header names. "Connection: close, X-Custom" means
+    // X-Custom is also hop-by-hop and must not be forwarded.
+    if (request.headers.get("Connection")) |conn| {
+        var it = std.mem.splitScalar(u8, conn, ',');
+        while (it.next()) |token_raw| {
+            const token = Request.trimOws(token_raw);
+            if (token.len == 0) continue;
+            // Skip the standard tokens we handle separately
+            if (Headers.eqlIgnoreCase(token, "close")) continue;
+            if (Headers.eqlIgnoreCase(token, "keep-alive")) continue;
+            headers.remove(token);
+        }
     }
 }
 
@@ -188,6 +186,14 @@ fn removeHopByHopHeaders(headers: *Headers) void {
 pub fn isBodyForbidden(status: Response.StatusCode) bool {
     const code = status.toInt();
     return (code >= 100 and code < 200) or code == 204 or code == 304;
+}
+
+/// Check if status code is a redirect that requires a Location header.
+fn isRedirect(status: Response.StatusCode) bool {
+    return switch (status) {
+        .moved_permanently, .found, .see_other, .use_proxy, .temporary_redirect => true,
+        else => false,
+    };
 }
 
 fn formatUsize(value: usize, buf: *[20]u8) []const u8 {
@@ -209,20 +215,24 @@ fn formatUsize(value: usize, buf: *[20]u8) []const u8 {
 
 const testing = std.testing;
 
-fn testHandler(request: *const Request) Response {
+const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+fn testHandler(request: *const Request, io: std.Io) Response {
     _ = request;
+    _ = io;
     return Response.init(.ok, "text/plain", "Hello, World!");
 }
 
-fn notFoundHandler(request: *const Request) Response {
+fn notFoundHandler(request: *const Request, io: std.Io) Response {
     _ = request;
+    _ = io;
     return Response.init(.not_found, "text/plain", "Not Found");
 }
 
 // RFC 2616 Section 8.1.2.1: HTTP/1.1 defaults to persistent connections.
 // A connection is persistent unless "Connection: close" is sent.
 test "Connection: HTTP/1.1 defaults to keep-alive" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
@@ -232,7 +242,7 @@ test "Connection: HTTP/1.1 defaults to keep-alive" {
 
 // /// RFC 2616 Section 8.1.2.1: Connection: close signals non-persistent.
 test "Connection: HTTP/1.1 with Connection: close" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "Connection: close\r\n" ++
@@ -243,7 +253,7 @@ test "Connection: HTTP/1.1 with Connection: close" {
 
 // /// RFC 2616 Section 8.1.2.1: HTTP/1.0 defaults to non-persistent.
 test "Connection: HTTP/1.0 defaults to close" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.0\r\n" ++
             "\r\n",
     );
@@ -252,7 +262,7 @@ test "Connection: HTTP/1.0 defaults to close" {
 
 // /// RFC 2616 Section 8.1.2.1: HTTP/1.0 with explicit keep-alive.
 test "Connection: HTTP/1.0 with Connection: keep-alive" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.0\r\n" ++
             "Connection: keep-alive\r\n" ++
             "\r\n",
@@ -262,34 +272,34 @@ test "Connection: HTTP/1.0 with Connection: keep-alive" {
 
 // /// RFC 2616 Section 14.18: Origin servers MUST include a Date header.
 test "Connection: processRequest adds Date header" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expect(resp.headers.get("Date") != null);
 }
 
 // /// RFC 2616 Section 14.38: Server header identification.
 test "Connection: processRequest adds Server header" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expectEqualStrings("httpz/0.1", resp.headers.get("Server").?);
 }
 
 // /// RFC 2616 Section 14.13: Content-Length header is added for known bodies.
 test "Connection: processRequest adds Content-Length" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     // Content-Length is auto-generated during serialization, not as a header
     try testing.expect(resp.auto_content_length);
     // Verify it appears in serialized output
@@ -300,30 +310,42 @@ test "Connection: processRequest adds Content-Length" {
 
 // /// RFC 2616 Section 8.1.2.1: Connection: close is added when client requests it.
 test "Connection: processRequest adds Connection: close when requested" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "Connection: close\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 
 // /// RFC 2616 Section 9.8: TRACE echoes the received request.
 test "Connection: TRACE method echoes request" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "TRACE /path HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
     // Body should contain the echoed request
     try testing.expect(resp.body.len > 0);
     // Should start with the request method
     try testing.expect(std.mem.startsWith(u8, resp.body, "TRACE"));
+}
+
+// RFC 2616 Section 14.18: TRACE responses MUST include a Date header.
+test "Connection: TRACE response includes Date header" {
+    const req = try Request.parseConst(
+        "TRACE /path HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequest(0, &req, testHandler, test_io);
+    try testing.expect(resp.headers.get("Date") != null);
+    try testing.expect(resp.headers.get("Server") != null);
 }
 
 // /// RFC 2616 Section 4.3: 1xx, 204, 304 responses MUST NOT include a body.
@@ -339,28 +361,65 @@ test "Connection: isBodyForbidden" {
 
 // /// RFC 2616 Section 14.13: No Content-Length for body-forbidden responses.
 test "Connection: no Content-Length for 204 No Content" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: std.Io) Response {
             return .{ .status = .no_content };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler);
+    const resp = processRequest(0, &req, handler, test_io);
     try testing.expect(resp.headers.get("Content-Length") == null);
+}
+
+// RFC 2616 Section 4.3: Body-forbidden responses MUST NOT include a body.
+test "Connection: 204 response body is stripped" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            return .{ .status = .no_content, .body = "should be stripped" };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.strip_body);
+    try testing.expectEqualStrings("", resp.body);
+}
+
+// RFC 2616 Section 4.3: 304 response body is stripped.
+test "Connection: 304 response body is stripped" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            return .{ .status = .not_modified, .body = "should be stripped" };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.strip_body);
+    try testing.expectEqualStrings("", resp.body);
+    var buf: [1024]u8 = undefined;
+    const serialized = try resp.serialize(&buf);
+    try testing.expect(std.mem.indexOf(u8, serialized, "should be stripped") == null);
 }
 
 // RFC 2616 Section 9.4: HEAD responses have headers but no body.
 test "Connection: HEAD response strips body but keeps Content-Length" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "HEAD / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expect(resp.strip_body);
     // Serialized output should have Content-Length but no body
     var buf: [1024]u8 = undefined;
@@ -373,25 +432,42 @@ test "Connection: HEAD response strips body but keeps Content-Length" {
 
 // RFC 2616 Section 3.1: Respond with HTTP/1.0 to HTTP/1.0 clients.
 test "Connection: HTTP/1.0 version downgrade" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.0\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expectEqual(Request.Version.http_1_0, resp.version);
     var buf: [1024]u8 = undefined;
     const serialized = try resp.serialize(&buf);
     try testing.expect(std.mem.startsWith(u8, serialized, "HTTP/1.0"));
 }
 
+// RFC 2616 Section 3.6: MUST NOT send chunked to HTTP/1.0 clients.
+test "Connection: chunked disabled for HTTP/1.0 clients" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.0\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            return .{ .status = .ok, .body = "chunked body", .chunked = true };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(!resp.chunked);
+    try testing.expect(resp.auto_content_length);
+    try testing.expectEqual(Request.Version.http_1_0, resp.version);
+}
+
 // RFC 2616 Section 9.2: OPTIONS response includes Allow header.
 test "Connection: OPTIONS response includes Allow" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "OPTIONS * HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler);
+    const resp = processRequest(0, &req, testHandler, test_io);
     try testing.expect(resp.headers.get("Allow") != null);
     const allow = resp.headers.get("Allow").?;
     try testing.expect(std.mem.indexOf(u8, allow, "GET") != null);
@@ -401,75 +477,142 @@ test "Connection: OPTIONS response includes Allow" {
 
 // RFC 2616 Section 10.4.6: 405 responses MUST include Allow header.
 test "Connection: 405 response includes Allow" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: std.Io) Response {
             return .{ .status = .method_not_allowed, .body = "Method Not Allowed" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler);
+    const resp = processRequest(0, &req, handler, test_io);
     try testing.expect(resp.headers.get("Allow") != null);
 }
 
 // RFC 2616 Section 13.5.1: Hop-by-hop headers are removed from responses.
 test "Connection: hop-by-hop headers removed" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: std.Io) Response {
             var resp = Response.init(.ok, "text/plain", "OK");
             resp.headers.append("Keep-Alive", "timeout=5") catch {};
             resp.headers.append("Proxy-Authenticate", "Basic") catch {};
+            resp.headers.append("Transfer-Encoding", "chunked") catch {};
             return resp;
         }
     }.handle;
-    const resp = processRequest(0, &req, handler);
+    const resp = processRequest(0, &req, handler, test_io);
     try testing.expect(resp.headers.get("Keep-Alive") == null);
     try testing.expect(resp.headers.get("Proxy-Authenticate") == null);
+    try testing.expect(resp.headers.get("Transfer-Encoding") == null);
     // Regular headers should remain
     try testing.expect(resp.headers.get("Content-Type") != null);
 }
 
+// RFC 2616 Section 14.10: Connection header tokens identify additional hop-by-hop headers.
+test "Connection: custom hop-by-hop headers from Connection field removed" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Connection: close, X-Custom-Hop\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            var resp = Response.init(.ok, "text/plain", "OK");
+            resp.headers.append("X-Custom-Hop", "should-be-removed") catch {};
+            resp.headers.append("X-Regular", "should-remain") catch {};
+            return resp;
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.headers.get("X-Custom-Hop") == null);
+    try testing.expectEqualStrings("should-remain", resp.headers.get("X-Regular").?);
+}
+
 // RFC 2616 Section 10.4.2: 401 responses MUST include WWW-Authenticate.
 test "Connection: 401 response includes WWW-Authenticate" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: std.Io) Response {
             return .{ .status = .unauthorized, .body = "Unauthorized" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler);
+    const resp = processRequest(0, &req, handler, test_io);
     try testing.expect(resp.headers.get("WWW-Authenticate") != null);
     try testing.expectEqualStrings("Basic realm=\"httpz\"", resp.headers.get("WWW-Authenticate").?);
 }
 
 // RFC 2616 Section 10.4.2: 401 with user-provided WWW-Authenticate is preserved.
 test "Connection: 401 preserves user WWW-Authenticate" {
-    const req = try Request.parse(
+    const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request) Response {
+        fn handle(_: *const Request, _: std.Io) Response {
             var resp: Response = .{ .status = .unauthorized, .body = "Unauthorized" };
             resp.headers.append("WWW-Authenticate", "Bearer realm=\"api\"") catch {};
             return resp;
         }
     }.handle;
-    const resp = processRequest(0, &req, handler);
+    const resp = processRequest(0, &req, handler, test_io);
     try testing.expectEqualStrings("Bearer realm=\"api\"", resp.headers.get("WWW-Authenticate").?);
+}
+
+// RFC 2616 Section 10.3.x: Redirect responses MUST include Location.
+test "Connection: redirect response gets default Location" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            return .{ .status = .moved_permanently };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.headers.get("Location") != null);
+}
+
+// RFC 2616 Section 10.3.x: User-provided Location is preserved.
+test "Connection: redirect preserves user Location" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            return Response.redirect(.found, "/new-page");
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expectEqualStrings("/new-page", resp.headers.get("Location").?);
+}
+
+// isRedirect utility
+test "Connection: isRedirect" {
+    try testing.expect(isRedirect(.moved_permanently));
+    try testing.expect(isRedirect(.found));
+    try testing.expect(isRedirect(.see_other));
+    try testing.expect(isRedirect(.use_proxy));
+    try testing.expect(isRedirect(.temporary_redirect));
+    try testing.expect(!isRedirect(.ok));
+    try testing.expect(!isRedirect(.not_found));
+    try testing.expect(!isRedirect(.not_modified));
 }
 
 // /// formatUsize utility

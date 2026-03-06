@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     try server.run(io);
 }
 
-fn handler(request: *const httpz.Request) httpz.Response {
+fn handler(request: *const httpz.Request, _: std.Io) httpz.Response {
     if (std.mem.eql(u8, request.uri, "/")) {
         return httpz.Response.init(.ok, "text/plain", "Hello from httpz!");
     }
@@ -34,25 +34,25 @@ fn handler(request: *const httpz.Request) httpz.Response {
 }
 
 test "handler returns 200 for root" {
-    const req = try httpz.Request.parse(
+    const req = try httpz.Request.parseConst(
         "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    const resp = handler(&req);
+    const resp = handler(&req, .{ .userdata = null, .vtable = undefined });
     try std.testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
 }
 
 test "handler returns 404 for unknown path" {
-    const req = try httpz.Request.parse(
+    const req = try httpz.Request.parseConst(
         "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    const resp = handler(&req);
+    const resp = handler(&req, .{ .userdata = null, .vtable = undefined });
     try std.testing.expectEqual(httpz.Response.StatusCode.not_found, resp.status);
 }
 
 test "handler returns health check" {
-    const req = try httpz.Request.parse(
+    const req = try httpz.Request.parseConst(
         "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    const resp = handler(&req);
+    const resp = handler(&req, .{ .userdata = null, .vtable = undefined });
     try std.testing.expectEqualStrings("{\"status\":\"ok\"}", resp.body);
 }

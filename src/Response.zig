@@ -165,8 +165,7 @@ pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
         pos = appendSlice(buf, pos, "Transfer-Encoding: chunked\r\n") orelse return error.ResponseTooLarge;
     } else if (self.auto_content_length and
         self.headers.get("Content-Length") == null and
-        self.headers.get("Transfer-Encoding") == null and
-        self.body.len > 0)
+        self.headers.get("Transfer-Encoding") == null)
     {
         // Auto-generate Content-Length if needed
         var cl_buf: [20]u8 = undefined;
@@ -361,6 +360,7 @@ test "Response: serialize no body" {
     const result = try resp.serialize(&buf);
     try testing.expectEqualStrings(
         "HTTP/1.1 204 No Content\r\n" ++
+            "Content-Length: 0\r\n" ++
             "\r\n",
         result,
     );
@@ -414,6 +414,7 @@ test "Response: serialize HTTP/1.0 response" {
     const result = try resp.serialize(&buf);
     try testing.expectEqualStrings(
         "HTTP/1.0 200 OK\r\n" ++
+            "Content-Length: 0\r\n" ++
             "\r\n",
         result,
     );
@@ -532,6 +533,21 @@ test "Response: formatHex" {
     try testing.expectEqualStrings("a", formatHex(10, &buf));
     try testing.expectEqualStrings("ff", formatHex(255, &buf));
     try testing.expectEqualStrings("100", formatHex(256, &buf));
+}
+
+// RFC 2616 Section 14.13: Content-Length: 0 for empty body responses.
+test "Response: serialize empty body includes Content-Length 0" {
+    const resp: Response = .{
+        .status = .ok,
+    };
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serialize(&buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "\r\n",
+        result,
+    );
 }
 
 // /// formatInt utility
