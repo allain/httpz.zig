@@ -41,6 +41,11 @@ pub const Config = struct {
     /// Connections with no activity for this duration will be closed.
     /// 0 means no timeout. Requires async Io backend for enforcement.
     keep_alive_timeout_s: u32 = 60,
+    /// Timeout in seconds for reading the initial request on a new
+    /// connection. Prevents slowloris-style attacks where a client
+    /// connects but never sends data. Applied independently of
+    /// keep_alive_timeout_s. 0 means no initial timeout.
+    initial_read_timeout_s: u32 = 30,
     /// Maximum number of concurrent connections. 0 means unlimited.
     /// When the limit is reached, new connections are accepted and
     /// immediately closed.
@@ -113,9 +118,14 @@ pub fn run(self: *Server, io: Io) !void {
 ///
 /// RFC 2616 Section 8.1: Persistent Connections
 fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
-    // RFC 2616 Section 8.1.4: Set socket read timeout for idle connections.
-    if (self.config.keep_alive_timeout_s > 0) {
-        setSocketTimeout(stream.socket.handle, self.config.keep_alive_timeout_s);
+    // Apply initial read timeout to prevent slowloris attacks on new connections.
+    // This is set before the first read and later replaced by keep_alive_timeout.
+    const initial_timeout = if (self.config.initial_read_timeout_s > 0)
+        self.config.initial_read_timeout_s
+    else
+        self.config.keep_alive_timeout_s;
+    if (initial_timeout > 0) {
+        setSocketTimeout(stream.socket.handle, initial_timeout);
     }
 
     var read_buf: [8192]u8 = undefined;
@@ -201,6 +211,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 error.MissingHostHeader => .bad_request,
                 error.MultipleHostHeaders => .bad_request,
                 error.ConflictingContentLength => .bad_request,
+                error.InvalidHostHeader => .bad_request,
                 error.UriPathTraversal => .bad_request,
                 error.LineTooLong => .request_uri_too_long,
                 error.BodyTooLarge => .request_entity_too_large,
@@ -248,6 +259,11 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // RFC 2616 Section 8.1: Check if connection should persist
         if (!Connection.shouldKeepAlive(&request)) {
             return;
+        }
+
+        // Switch to keep-alive timeout for subsequent requests.
+        if (self.config.keep_alive_timeout_s > 0) {
+            setSocketTimeout(stream.socket.handle, self.config.keep_alive_timeout_s);
         }
     }
 }
@@ -520,31 +536,10 @@ fn findHeaderEnd(data: []const u8) ?usize {
 }
 
 /// Quick extraction of Content-Length from raw header bytes without full parsing.
+/// Delegates to extractHeaderValue for robust case-insensitive matching.
 fn extractContentLength(headers: []const u8) ?usize {
-    var pos: usize = 0;
-    while (pos < headers.len) {
-        const line_end = blk: {
-            var j = pos;
-            while (j + 1 < headers.len) : (j += 1) {
-                if (headers[j] == '\r' and headers[j + 1] == '\n') break :blk j;
-            }
-            break :blk headers.len;
-        };
-        const line = headers[pos..line_end];
-        pos = if (line_end + 2 <= headers.len) line_end + 2 else headers.len;
-
-        if (line.len > 16 and
-            (line[0] == 'C' or line[0] == 'c') and
-            (line[7] == '-' or line[7] == '-'))
-        {
-            const lower = asciiLowerLine(line[0..@min(line.len, 16)]);
-            if (std.mem.startsWith(u8, &lower, "content-length:")) {
-                const val = Request.trimOws(line[15..]);
-                return std.fmt.parseInt(usize, val, 10) catch null;
-            }
-        }
-    }
-    return null;
+    const val = extractHeaderValue(headers, "content-length") orelse return null;
+    return std.fmt.parseInt(usize, val, 10) catch null;
 }
 
 /// Extract the value of a named header from raw header bytes (case-insensitive).
@@ -578,18 +573,9 @@ fn setSocketTimeout(handle: Io.net.Socket.Handle, timeout_s: u32) void {
         .sec = @intCast(timeout_s),
         .usec = 0,
     };
-    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
-}
-
-fn asciiLowerLine(input: []const u8) [16]u8 {
-    var result: [16]u8 = undefined;
-    for (input, 0..) |c, i| {
-        result[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-    }
-    for (input.len..16) |i| {
-        result[i] = 0;
-    }
-    return result;
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch |err| {
+        std.log.warn("setsockopt SO_RCVTIMEO failed: {}", .{err});
+    };
 }
 
 /// Check if an IP address string is in a private/loopback range.
@@ -709,12 +695,6 @@ test "Server: isAllZeros" {
     try testing.expect(!isAllZeros("01"));
     try testing.expect(!isAllZeros("a"));
     try testing.expect(!isAllZeros(""));
-}
-
-// /// asciiLowerLine utility
-test "Server: asciiLowerLine" {
-    const result = asciiLowerLine("Content-Length:");
-    try testing.expectEqualStrings("content-length:", result[0..15]);
 }
 
 // Private IP detection for proxy SSRF protection

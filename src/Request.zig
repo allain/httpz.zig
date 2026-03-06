@@ -105,6 +105,8 @@ pub const ParseError = error{
     ConflictingContentLength,
     /// URI contains path traversal sequences (e.g. /../, /%2e%2e/)
     UriPathTraversal,
+    /// RFC 2616 Section 14.23: Invalid Host header value
+    InvalidHostHeader,
 };
 
 /// Parse a complete HTTP/1.1 request from raw bytes.
@@ -195,6 +197,12 @@ pub fn parse(data: []u8) ParseError!Request {
             // and use the URI's host instead (already appended by extract fn).
         } else if (host_count == 0) {
             return error.MissingHostHeader;
+        }
+
+        // Validate Host header value: no control characters, no whitespace,
+        // must match host[:port] pattern.
+        if (request.headers.get("Host")) |host| {
+            if (!isValidHostValue(host)) return error.InvalidHostHeader;
         }
     }
 
@@ -328,6 +336,48 @@ pub fn acceptsEncoding(self: *const Request, encoding: []const u8) bool {
 
 /// RFC 2616 Section 5.2: Extract host from an absolute URI and replace
 /// any existing Host header. Returns true if a host was found.
+/// RFC 2616 Section 14.23: Validate Host header value.
+/// Must be a valid hostname or IP, optionally followed by :port.
+/// Rejects control characters, whitespace, and other invalid characters.
+fn isValidHostValue(host: []const u8) bool {
+    if (host.len == 0) return false;
+
+    // IPv6 literal: [addr] or [addr]:port
+    if (host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+        // Validate IPv6 address characters inside brackets
+        for (host[1..close]) |c| {
+            if (!std.ascii.isHex(c) and c != ':' and c != '.') return false;
+        }
+        // After ']', must be end or :port
+        const after = host[close + 1 ..];
+        if (after.len == 0) return true;
+        if (after[0] != ':' or after.len < 2) return false;
+        _ = std.fmt.parseInt(u16, after[1..], 10) catch return false;
+        return true;
+    }
+
+    // Regular hostname or IPv4: find optional port suffix
+    const colon = std.mem.lastIndexOfScalar(u8, host, ':');
+    const hostname = if (colon) |c| host[0..c] else host;
+    const port_str = if (colon) |c| host[c + 1 ..] else "";
+
+    if (hostname.len == 0) return false;
+
+    // Validate port if present
+    if (port_str.len > 0) {
+        _ = std.fmt.parseInt(u16, port_str, 10) catch return false;
+    }
+
+    for (hostname) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '.' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn extractHostFromAbsoluteUri(request: *Request) bool {
     const uri = request.uri;
     // Look for "://" scheme separator
@@ -791,9 +841,15 @@ pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!ChunkedResult {
 
 /// Parse from a const slice. This copies into an internal buffer first
 /// so the parse can do in-place modifications (header continuation folding).
-/// Primarily useful for tests. Production code should use `parse()` with
-/// a mutable buffer.
-pub fn parseConst(data: []const u8) ParseError!Request {
+/// Only available in test and debug builds. Production code MUST use
+/// `parse()` with a mutable buffer — the threadlocal buffer used here
+/// has lifetime issues in concurrent production workloads.
+pub const parseConst = if (@import("builtin").is_test or @import("builtin").mode == .Debug)
+    parseConstImpl
+else
+    @compileError("parseConst is only available in test/debug builds; use parse() with a mutable buffer");
+
+fn parseConstImpl(data: []const u8) ParseError!Request {
     const S = struct {
         threadlocal var buf: [max_request_line_len + max_header_line_len * Headers.max_headers + max_body_len]u8 = undefined;
     };
@@ -1669,4 +1725,38 @@ test "Request: three identical Content-Length headers accepted" {
         "hello";
     const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("hello", req.body);
+}
+
+// RFC 2616 Section 14.23: Host header validation
+test "Request: valid Host headers accepted" {
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: sub.domain.example.com\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: 192.168.1.1\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: 192.168.1.1:443\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n");
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n");
+}
+
+test "Request: invalid Host header rejected" {
+    // Control characters
+    try testing.expectError(error.InvalidHostHeader, Request.parseConst(
+        "GET / HTTP/1.1\r\nHost: example\x00.com\r\n\r\n",
+    ));
+    // Whitespace in host
+    try testing.expectError(error.InvalidHostHeader, Request.parseConst(
+        "GET / HTTP/1.1\r\nHost: example .com\r\n\r\n",
+    ));
+    // Path characters
+    try testing.expectError(error.InvalidHostHeader, Request.parseConst(
+        "GET / HTTP/1.1\r\nHost: example.com/path\r\n\r\n",
+    ));
+    // Invalid port
+    try testing.expectError(error.InvalidHostHeader, Request.parseConst(
+        "GET / HTTP/1.1\r\nHost: example.com:abc\r\n\r\n",
+    ));
+    // At sign
+    try testing.expectError(error.InvalidHostHeader, Request.parseConst(
+        "GET / HTTP/1.1\r\nHost: user@example.com\r\n\r\n",
+    ));
 }
