@@ -13,6 +13,21 @@ const Proxy = @import("Proxy.zig");
 /// This server uses the Zig 0.16 std.Io interface for networking,
 /// supporting both threaded and evented I/O backends.
 
+/// Proxy access control configuration.
+/// Controls which targets can be reached through CONNECT tunneling.
+pub const ProxyConfig = struct {
+    /// Allowed destination ports. If empty, all ports are allowed.
+    /// Common safe default: &.{443} (HTTPS only).
+    allowed_ports: []const u16 = &.{443},
+    /// Block connections to private/loopback IP ranges (SSRF protection).
+    /// When true, rejects targets resolving to 127.0.0.0/8, 10.0.0.0/8,
+    /// 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, and ::1.
+    block_private_ips: bool = true,
+    /// Optional allowed target hosts. If non-empty, only these hosts
+    /// are permitted as CONNECT targets. Checked case-insensitively.
+    allowed_hosts: []const []const u8 = &.{},
+};
+
 pub const Config = struct {
     port: u16 = 8080,
     address: []const u8 = "127.0.0.1",
@@ -26,10 +41,17 @@ pub const Config = struct {
     /// Connections with no activity for this duration will be closed.
     /// 0 means no timeout. Requires async Io backend for enforcement.
     keep_alive_timeout_s: u32 = 60,
+    /// RFC 2616 Section 9.8: Enable TRACE method support.
+    /// TRACE echoes the full request (including headers like Cookie and
+    /// Authorization) back to the client. This is a security risk (XST)
+    /// and is disabled by default.
+    enable_trace: bool = false,
     /// RFC 2616 Section 9.9 / 14.45: Enable proxy support.
     /// When true, the server handles CONNECT requests for tunneling
     /// and adds Via headers to proxied responses.
     enable_proxy: bool = false,
+    /// Proxy access control settings. Only used when enable_proxy is true.
+    proxy: ProxyConfig = .{},
 };
 
 config: Config,
@@ -157,6 +179,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 error.MissingHostHeader => .bad_request,
                 error.MultipleHostHeaders => .bad_request,
                 error.ConflictingContentLength => .bad_request,
+                error.UriPathTraversal => .bad_request,
                 error.LineTooLong => .request_uri_too_long,
                 error.BodyTooLarge => .request_entity_too_large,
                 error.InvalidContentLength => .bad_request,
@@ -178,7 +201,9 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         // Process the request
         const timestamp = Date.now(io);
-        var response = Connection.processRequest(timestamp, &request, self.handler, io);
+        var response = Connection.processRequestWithOptions(timestamp, &request, self.handler, io, .{
+            .enable_trace = self.config.enable_trace,
+        });
 
         // RFC 2616 Section 14.45: Add Via header for proxied responses.
         if (self.config.enable_proxy) {
@@ -214,8 +239,6 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 /// Note: Bidirectional forwarding uses an alternating read loop. For
 /// full-duplex tunneling (e.g., TLS), the async Io backend is recommended.
 fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *const Request, client_writer: *Io.net.Stream.Writer) !void {
-    _ = self;
-
     const authority = Proxy.parseAuthority(request.uri) orelse {
         const resp: Response = .{ .status = .bad_request, .body = "Invalid CONNECT authority" };
         var resp_buf: [Response.max_response_len]u8 = undefined;
@@ -224,6 +247,57 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
         client_writer.interface.flush() catch return;
         return;
     };
+
+    // Proxy access control: check allowed ports
+    const proxy_cfg = self.config.proxy;
+    if (proxy_cfg.allowed_ports.len > 0) {
+        var port_allowed = false;
+        for (proxy_cfg.allowed_ports) |p| {
+            if (p == authority.port) {
+                port_allowed = true;
+                break;
+            }
+        }
+        if (!port_allowed) {
+            const resp: Response = .{ .status = .forbidden, .body = "Port not allowed" };
+            var resp_buf: [Response.max_response_len]u8 = undefined;
+            const resp_data = resp.serialize(&resp_buf) catch return;
+            client_writer.interface.writeAll(resp_data) catch return;
+            client_writer.interface.flush() catch return;
+            return;
+        }
+    }
+
+    // Proxy access control: check allowed hosts
+    if (proxy_cfg.allowed_hosts.len > 0) {
+        var host_allowed = false;
+        for (proxy_cfg.allowed_hosts) |h| {
+            if (Headers.eqlIgnoreCase(h, authority.host)) {
+                host_allowed = true;
+                break;
+            }
+        }
+        if (!host_allowed) {
+            const resp: Response = .{ .status = .forbidden, .body = "Host not allowed" };
+            var resp_buf: [Response.max_response_len]u8 = undefined;
+            const resp_data = resp.serialize(&resp_buf) catch return;
+            client_writer.interface.writeAll(resp_data) catch return;
+            client_writer.interface.flush() catch return;
+            return;
+        }
+    }
+
+    // Proxy access control: block private/loopback IPs (SSRF protection)
+    if (proxy_cfg.block_private_ips) {
+        if (isPrivateIp(authority.host)) {
+            const resp: Response = .{ .status = .forbidden, .body = "Private IP targets not allowed" };
+            var resp_buf: [Response.max_response_len]u8 = undefined;
+            const resp_data = resp.serialize(&resp_buf) catch return;
+            client_writer.interface.writeAll(resp_data) catch return;
+            client_writer.interface.flush() catch return;
+            return;
+        }
+    }
 
     // Connect to the target server.
     const target_addr = Io.net.IpAddress.parseIp4(authority.host, authority.port) catch {
@@ -480,6 +554,58 @@ fn asciiLowerLine(input: []const u8) [16]u8 {
     return result;
 }
 
+/// Check if an IP address string is in a private/loopback range.
+/// Blocks: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+/// 169.254.0.0/16 (link-local), 0.0.0.0, and IPv6 loopback (::1).
+fn isPrivateIp(host: []const u8) bool {
+    // IPv6 loopback
+    if (std.mem.eql(u8, host, "::1")) return true;
+    if (std.mem.eql(u8, host, "0.0.0.0")) return true;
+
+    // Parse IPv4 octets
+    const octets = parseIpv4Octets(host) orelse return false;
+
+    // 127.0.0.0/8
+    if (octets[0] == 127) return true;
+    // 10.0.0.0/8
+    if (octets[0] == 10) return true;
+    // 172.16.0.0/12
+    if (octets[0] == 172 and octets[1] >= 16 and octets[1] <= 31) return true;
+    // 192.168.0.0/16
+    if (octets[0] == 192 and octets[1] == 168) return true;
+    // 169.254.0.0/16 (link-local)
+    if (octets[0] == 169 and octets[1] == 254) return true;
+
+    return false;
+}
+
+fn parseIpv4Octets(host: []const u8) ?[4]u8 {
+    var octets: [4]u8 = undefined;
+    var octet_idx: usize = 0;
+    var current: u16 = 0;
+    var has_digit = false;
+
+    for (host) |c| {
+        if (c == '.') {
+            if (!has_digit or octet_idx >= 3) return null;
+            if (current > 255) return null;
+            octets[octet_idx] = @intCast(current);
+            octet_idx += 1;
+            current = 0;
+            has_digit = false;
+        } else if (c >= '0' and c <= '9') {
+            current = current * 10 + (c - '0');
+            has_digit = true;
+        } else {
+            return null;
+        }
+    }
+    if (!has_digit or octet_idx != 3) return null;
+    if (current > 255) return null;
+    octets[3] = @intCast(current);
+    return octets;
+}
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -551,4 +677,66 @@ test "Server: isAllZeros" {
 test "Server: asciiLowerLine" {
     const result = asciiLowerLine("Content-Length:");
     try testing.expectEqualStrings("content-length:", result[0..15]);
+}
+
+// Private IP detection for proxy SSRF protection
+test "Server: isPrivateIp loopback" {
+    try testing.expect(isPrivateIp("127.0.0.1"));
+    try testing.expect(isPrivateIp("127.255.255.255"));
+    try testing.expect(isPrivateIp("::1"));
+    try testing.expect(isPrivateIp("0.0.0.0"));
+}
+
+test "Server: isPrivateIp private ranges" {
+    try testing.expect(isPrivateIp("10.0.0.1"));
+    try testing.expect(isPrivateIp("10.255.255.255"));
+    try testing.expect(isPrivateIp("172.16.0.1"));
+    try testing.expect(isPrivateIp("172.31.255.255"));
+    try testing.expect(isPrivateIp("192.168.0.1"));
+    try testing.expect(isPrivateIp("192.168.255.255"));
+    try testing.expect(isPrivateIp("169.254.1.1"));
+}
+
+test "Server: isPrivateIp public IPs" {
+    try testing.expect(!isPrivateIp("8.8.8.8"));
+    try testing.expect(!isPrivateIp("1.1.1.1"));
+    try testing.expect(!isPrivateIp("203.0.113.1"));
+    try testing.expect(!isPrivateIp("172.32.0.1"));
+    try testing.expect(!isPrivateIp("172.15.255.255"));
+}
+
+test "Server: isPrivateIp non-IP hostnames" {
+    try testing.expect(!isPrivateIp("example.com"));
+    try testing.expect(!isPrivateIp("localhost"));
+    try testing.expect(!isPrivateIp(""));
+}
+
+test "Server: parseIpv4Octets" {
+    const valid = parseIpv4Octets("192.168.1.1").?;
+    try testing.expectEqual(@as(u8, 192), valid[0]);
+    try testing.expectEqual(@as(u8, 168), valid[1]);
+    try testing.expectEqual(@as(u8, 1), valid[2]);
+    try testing.expectEqual(@as(u8, 1), valid[3]);
+
+    try testing.expect(parseIpv4Octets("256.0.0.1") == null);
+    try testing.expect(parseIpv4Octets("1.2.3") == null);
+    try testing.expect(parseIpv4Octets("1.2.3.4.5") == null);
+    try testing.expect(parseIpv4Octets("abc") == null);
+    try testing.expect(parseIpv4Octets("") == null);
+}
+
+// ProxyConfig defaults
+test "Server: ProxyConfig defaults" {
+    const cfg: ProxyConfig = .{};
+    try testing.expect(cfg.block_private_ips);
+    try testing.expectEqual(@as(usize, 1), cfg.allowed_ports.len);
+    try testing.expectEqual(@as(u16, 443), cfg.allowed_ports[0]);
+    try testing.expectEqual(@as(usize, 0), cfg.allowed_hosts.len);
+}
+
+// Config defaults
+test "Server: Config defaults include trace disabled" {
+    const cfg: Config = .{};
+    try testing.expect(!cfg.enable_trace);
+    try testing.expect(!cfg.enable_proxy);
 }

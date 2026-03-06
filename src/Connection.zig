@@ -44,10 +44,26 @@ pub fn shouldKeepAlive(request: *const Request) bool {
 /// RFC 2616 Section 9.2 / 10.4.6: The Allow header lists the set of methods
 /// supported by the resource. Used in OPTIONS and 405 responses.
 pub const default_allow = "GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE, PATCH";
+pub const default_allow_no_trace = "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH";
+
+pub const ProcessOptions = struct {
+    enable_trace: bool = false,
+};
 
 pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler, io: std.Io) Response {
+    return processRequestWithOptions(timestamp, request, handler, io, .{});
+}
+
+pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handler: Handler, io: std.Io, options: ProcessOptions) Response {
     // RFC 2616 Section 9.8: TRACE method echoes the request.
+    // Disabled by default to prevent Cross-Site Tracing (XST) attacks.
     if (request.method == .TRACE) {
+        if (!options.enable_trace) {
+            var response: Response = .{ .status = .method_not_allowed, .body = "Method Not Allowed" };
+            response.headers.append("Allow", default_allow_no_trace) catch {};
+            addStandardHeaders(&response, timestamp, request);
+            return response;
+        }
         var response = handleTrace(request);
         addStandardHeaders(&response, timestamp, request);
         return response;
@@ -320,14 +336,14 @@ test "Connection: processRequest adds Connection: close when requested" {
     try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 
-// /// RFC 2616 Section 9.8: TRACE echoes the received request.
+// /// RFC 2616 Section 9.8: TRACE echoes the received request (when enabled).
 test "Connection: TRACE method echoes request" {
     const req = try Request.parseConst(
         "TRACE /path HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
     // Body should contain the echoed request
@@ -343,7 +359,7 @@ test "Connection: TRACE response includes Date header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
     try testing.expect(resp.headers.get("Date") != null);
     try testing.expect(resp.headers.get("Server") != null);
 }
@@ -613,6 +629,33 @@ test "Connection: isRedirect" {
     try testing.expect(!isRedirect(.ok));
     try testing.expect(!isRedirect(.not_found));
     try testing.expect(!isRedirect(.not_modified));
+}
+
+// TRACE is disabled by default
+test "Connection: TRACE disabled by default returns 405" {
+    const req = try Request.parseConst(
+        "TRACE /path HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = false });
+    try testing.expectEqual(Response.StatusCode.method_not_allowed, resp.status);
+    try testing.expect(resp.headers.get("Allow") != null);
+    // Should not contain TRACE in allowed methods
+    const allow = resp.headers.get("Allow").?;
+    try testing.expect(std.mem.indexOf(u8, allow, "TRACE") == null);
+}
+
+// TRACE works when explicitly enabled
+test "Connection: TRACE works when enabled" {
+    const req = try Request.parseConst(
+        "TRACE /path HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
+    try testing.expectEqual(Response.StatusCode.ok, resp.status);
+    try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
 }
 
 // /// formatUsize utility

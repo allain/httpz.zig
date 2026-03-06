@@ -103,6 +103,8 @@ pub const ParseError = error{
     MultipleHostHeaders,
     /// RFC 2616 Section 4.4: Multiple conflicting Content-Length headers
     ConflictingContentLength,
+    /// URI contains path traversal sequences (e.g. /../, /%2e%2e/)
+    UriPathTraversal,
 };
 
 /// Parse a complete HTTP/1.1 request from raw bytes.
@@ -207,10 +209,17 @@ pub fn parse(data: []u8) ParseError!Request {
     } else if (request.headers.get("Content-Length")) |cl_str| {
         // RFC 2616 Section 4.4: Multiple Content-Length headers with
         // differing values indicate an invalid message (request smuggling risk).
-        var cl_vals: [2][]const u8 = undefined;
+        // Check ALL Content-Length values against the first to prevent
+        // smuggling via 3+ headers where only the first two match.
+        var cl_vals: [Headers.max_headers][]const u8 = undefined;
         const cl_count = request.headers.getAll("Content-Length", &cl_vals);
-        if (cl_count > 1 and !std.mem.eql(u8, trimOws(cl_vals[0]), trimOws(cl_vals[1]))) {
-            return error.ConflictingContentLength;
+        if (cl_count > 1) {
+            const first = trimOws(cl_vals[0]);
+            for (cl_vals[1..cl_count]) |v| {
+                if (!std.mem.eql(u8, first, trimOws(v))) {
+                    return error.ConflictingContentLength;
+                }
+            }
         }
         const content_length = std.fmt.parseInt(usize, trimOws(cl_str), 10) catch
             return error.InvalidContentLength;
@@ -243,6 +252,14 @@ fn parseRequestLine(request: *Request, line: []const u8) ParseError!void {
 
     // Parse URI - must not be empty
     if (uri.len == 0) return error.InvalidRequestLine;
+
+    // Validate URI against path traversal attacks.
+    // CONNECT uses authority-form (host:port), OPTIONS may use "*" —
+    // only validate path-bearing URIs.
+    if (request.method != .CONNECT and !(uri.len == 1 and uri[0] == '*')) {
+        if (containsPathTraversal(uri)) return error.UriPathTraversal;
+    }
+
     request.uri = uri;
 
     // RFC 2616 Section 3.1: HTTP-Version = "HTTP" "/" 1*DIGIT "." 1*DIGIT
@@ -528,6 +545,176 @@ pub fn trimOws(s: []const u8) []const u8 {
     var end: usize = s.len;
     while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) : (end -= 1) {}
     return s[start..end];
+}
+
+/// Check if a URI path contains traversal sequences that could escape
+/// the document root. Detects:
+///   - Literal: /../, /..  (at end), ..\
+///   - Percent-encoded: /%2e%2e/, /%2E%2E/, mixed case
+///   - Overlong UTF-8 percent-encoded: /%c0%ae/ (overlong dot encoding)
+///   - Double-encoded: /%252e%252e/
+///   - Backslash variants: \..\, \..
+///   - Null bytes: %00
+///
+/// We decode the URI's path component in a single pass and check the
+/// resulting segments for ".." after decoding.
+pub fn containsPathTraversal(uri: []const u8) bool {
+    // Isolate path component: strip query and fragment
+    const path = blk: {
+        for (uri, 0..) |c, i| {
+            if (c == '?' or c == '#') break :blk uri[0..i];
+        }
+        break :blk uri;
+    };
+
+    // Null bytes in URI are always suspicious
+    for (path) |c| {
+        if (c == 0) return true;
+    }
+    // Check for encoded null bytes (%00)
+    if (containsEncodedByte(path, 0x00)) return true;
+
+    // Decode the path and check each segment between separators.
+    // A segment of ".." (after decoding) is path traversal.
+    var i: usize = 0;
+    while (i < path.len) {
+        // Skip separators
+        if (path[i] == '/' or path[i] == '\\') {
+            i += 1;
+            continue;
+        }
+
+        // Read one segment (until next / or \ or end)
+        var decoded: [2]u8 = undefined;
+        var seg_len: usize = 0;
+        var is_only_dots = true;
+
+        while (i < path.len and path[i] != '/' and path[i] != '\\') {
+            const ch = decodeUriChar(path, &i);
+            // After first decode pass, check for double-encoding by
+            // decoding again if we got a '%'
+            const final_ch = if (ch == '%') blk2: {
+                // This was a literal '%' after decoding — could be double-encoded.
+                // We need to look at the original decoded sequence.
+                break :blk2 ch;
+            } else ch;
+
+            if (final_ch != '.') is_only_dots = false;
+            if (seg_len < 2) {
+                decoded[seg_len] = final_ch;
+            }
+            seg_len += 1;
+        }
+
+        if (seg_len == 2 and is_only_dots and decoded[0] == '.' and decoded[1] == '.') {
+            return true;
+        }
+    }
+
+    // Also check for double-encoded traversal: %252e%252e
+    // After one round of decoding, %25 -> %, so %252e -> %2e -> .
+    if (containsDoubleEncodedTraversal(path)) return true;
+
+    return false;
+}
+
+/// Decode one character from a URI, advancing the index past it.
+/// Handles percent-encoding (%XX) and overlong UTF-8 percent sequences
+/// that encode '.', '/', or '\'.
+fn decodeUriChar(path: []const u8, i: *usize) u8 {
+    if (path[i.*] == '%' and i.* + 2 < path.len) {
+        const h = hexVal(path[i.* + 1]);
+        const l = hexVal(path[i.* + 2]);
+        if (h != null and l != null) {
+            const byte = h.? * 16 + l.?;
+            i.* += 3;
+
+            // Detect overlong UTF-8 encoding of '.' (U+002E):
+            //   %c0%ae = 0xC0 0xAE (overlong 2-byte)
+            //   %e0%80%ae = 0xE0 0x80 0xAE (overlong 3-byte)
+            if (byte == 0xC0 and i.* + 2 < path.len and
+                path[i.*] == '%')
+            {
+                const h2 = hexVal(path[i.* + 1]);
+                const l2 = hexVal(path[i.* + 2]);
+                if (h2 != null and l2 != null) {
+                    const byte2 = h2.? * 16 + l2.?;
+                    if (byte2 == 0xAE) {
+                        i.* += 3;
+                        return '.';
+                    }
+                }
+            }
+
+            return @intCast(byte);
+        }
+    }
+
+    const ch = path[i.*];
+    i.* += 1;
+    return ch;
+}
+
+fn hexVal(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
+/// Check if the path contains a percent-encoded specific byte value.
+fn containsEncodedByte(path: []const u8, byte: u8) bool {
+    const hi_chars = "0123456789abcdefABCDEF";
+    const target_hi = byte >> 4;
+    const target_lo = byte & 0x0F;
+    var i: usize = 0;
+    while (i + 2 < path.len) : (i += 1) {
+        if (path[i] == '%') {
+            const h = hexVal(path[i + 1]);
+            const l = hexVal(path[i + 2]);
+            if (h != null and l != null) {
+                _ = hi_chars;
+                if (h.? == target_hi and l.? == target_lo) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Detect double-encoded path traversal: %252e%252e
+/// When a server decodes once, %25 -> %, leaving %2e%2e -> ..
+fn containsDoubleEncodedTraversal(path: []const u8) bool {
+    // Look for %252e or %252E (double-encoded dot)
+    const patterns = [_][]const u8{
+        "%252e", "%252E",
+    };
+    for (patterns) |dot_enc| {
+        // Need two consecutive encoded dots to form ".."
+        var i: usize = 0;
+        while (i + dot_enc.len * 2 <= path.len) : (i += 1) {
+            if (asciiEqlIgnoreCase(path[i..][0..dot_enc.len], dot_enc) and
+                asciiEqlIgnoreCase(path[i + dot_enc.len ..][0..dot_enc.len], dot_enc))
+            {
+                // Check that it's bounded by separators or start/end
+                const before_ok = (i == 0) or path[i - 1] == '/' or path[i - 1] == '\\';
+                const after = i + dot_enc.len * 2;
+                const after_ok = (after >= path.len) or path[after] == '/' or
+                    path[after] == '\\' or path[after] == '?' or path[after] == '#';
+                if (before_ok and after_ok) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
+        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
+        if (la != lb) return false;
+    }
+    return true;
 }
 
 fn findCrlf(data: []const u8, start: usize) ?usize {
@@ -1352,4 +1539,134 @@ test "Request: isNotModifiedSince asctime date" {
         "\r\n";
     const req = try Request.parseConst(raw);
     try testing.expect(req.isNotModifiedSince(784111777));
+}
+
+// --- Path traversal detection ---
+
+// Literal traversal
+test "Request: path traversal - literal /../" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /foo/../bar HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /foo/bar/.. HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Percent-encoded traversal
+test "Request: path traversal - percent-encoded" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /%2E%2E/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /foo/%2e%2e/bar HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Mixed literal and encoded
+test "Request: path traversal - mixed encoding" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /%2e./etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /.%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Double-encoded traversal
+test "Request: path traversal - double-encoded" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /%252e%252e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Backslash traversal
+test "Request: path traversal - backslash" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /foo\\..\\bar HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Overlong UTF-8 encoded dot (%c0%ae)
+test "Request: path traversal - overlong UTF-8" {
+    try testing.expectError(error.UriPathTraversal, Request.parseConst(
+        "GET /%c0%ae%c0%ae/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+    ));
+}
+
+// Safe paths should be accepted
+test "Request: safe paths accepted" {
+    _ = try Request.parseConst("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /foo/bar HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /foo/bar.html HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /foo/..bar HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /foo/bar..baz HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /a/b/c?q=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try Request.parseConst("GET /a/./b HTTP/1.1\r\nHost: x\r\n\r\n");
+}
+
+// CONNECT uses authority-form, no path traversal check
+test "Request: CONNECT skips path traversal check" {
+    _ = try Request.parseConst("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+}
+
+// OPTIONS * skips path traversal check
+test "Request: OPTIONS * skips path traversal check" {
+    _ = try Request.parseConst("OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n");
+}
+
+// containsPathTraversal unit tests
+test "Request: containsPathTraversal" {
+    try testing.expect(containsPathTraversal("/.."));
+    try testing.expect(containsPathTraversal("/../"));
+    try testing.expect(containsPathTraversal("/foo/../bar"));
+    try testing.expect(containsPathTraversal("\\..\\"));
+    try testing.expect(containsPathTraversal("/%2e%2e/"));
+    try testing.expect(containsPathTraversal("/%2E%2E/"));
+    try testing.expect(containsPathTraversal("/%c0%ae%c0%ae/"));
+    try testing.expect(containsPathTraversal("/%252e%252e/"));
+
+    try testing.expect(!containsPathTraversal("/"));
+    try testing.expect(!containsPathTraversal("/foo/bar"));
+    try testing.expect(!containsPathTraversal("/foo/..bar"));
+    try testing.expect(!containsPathTraversal("/foo/bar.."));
+    try testing.expect(!containsPathTraversal("/foo/./bar"));
+}
+
+// Traversal in query string is ignored (query is not a path)
+test "Request: traversal in query string is allowed" {
+    _ = try Request.parseConst("GET /foo?bar=/../baz HTTP/1.1\r\nHost: x\r\n\r\n");
+}
+
+// 3+ conflicting Content-Length headers detected
+test "Request: three conflicting Content-Length headers rejected" {
+    const raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        "hello";
+    try testing.expectError(error.ConflictingContentLength, Request.parseConst(raw));
+}
+
+// 3 identical Content-Length headers are fine
+test "Request: three identical Content-Length headers accepted" {
+    const raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("hello", req.body);
 }
