@@ -4,6 +4,8 @@ const Io = std.Io;
 const Request = @import("Request.zig");
 const Response = @import("Response.zig");
 const Connection = @import("Connection.zig");
+const Headers = @import("Headers.zig");
+const Date = @import("Date.zig");
 
 /// RFC 2616 Section 1.4: HTTP/1.1 server implementation.
 ///
@@ -39,9 +41,7 @@ pub fn init(config: Config, handler: Connection.Handler) Server {
 pub fn run(self: *Server, io: Io) !void {
     const addr = try Io.net.IpAddress.parseIp4(self.config.address, self.config.port);
 
-    var server = try Io.net.IpAddress.listen(addr, io, .{
-        .reuse_address = true,
-    });
+    var server = try Io.net.IpAddress.listen(addr, io, .{});
     defer server.deinit(io);
 
     while (true) {
@@ -71,11 +71,35 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     var request_buf: [1_048_576]u8 = undefined;
 
     while (true) {
-        // Read request data
-        const request_data = readRequest(&net_reader.interface, &request_buf) catch |err| switch (err) {
+        // Read request headers
+        const header_len = readHeaders(&net_reader.interface, &request_buf) catch |err| switch (err) {
             error.EndOfStream => return, // Client closed connection
             else => return err,
         };
+
+        // RFC 2616 Section 8.2.3: Check for Expect: 100-continue.
+        // If present, send "100 Continue" before reading the body.
+        const expect_continue = extractHeaderValue(request_buf[0..header_len], "expect");
+        if (expect_continue != null and Headers.eqlIgnoreCase(expect_continue.?, "100-continue")) {
+            net_writer.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
+            net_writer.interface.flush() catch return;
+        }
+
+        // Read body if Content-Length is present
+        var total = header_len;
+        const cl = extractContentLength(request_buf[0..header_len]);
+        if (cl) |body_len| {
+            const to_read = @min(body_len, request_buf.len - total);
+            if (to_read > 0) {
+                net_reader.interface.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
+                    error.EndOfStream => {},
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                total += to_read;
+            }
+        }
+
+        const request_data = request_buf[0..total];
 
         // Parse the request
         const request = Request.parse(request_data) catch |err| {
@@ -97,7 +121,8 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         };
 
         // Process the request
-        const response = Connection.processRequest(&request, self.handler);
+        const timestamp = Date.now(io);
+        const response = Connection.processRequest(timestamp, &request, self.handler);
 
         // Serialize and send response
         var resp_buf: [Response.max_response_len]u8 = undefined;
@@ -119,45 +144,39 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     }
 }
 
-/// Read a complete HTTP request from the stream.
-///
-/// Reads data until we find the end-of-headers marker (CRLFCRLF),
-/// then reads any remaining body based on Content-Length.
-fn readRequest(reader: *Io.Reader, buf: []u8) ![]const u8 {
+/// Read HTTP headers from the stream, line by line until the blank line
+/// terminator (\r\n\r\n). Returns the number of bytes read including
+/// the terminator.
+fn readHeaders(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
     var total: usize = 0;
 
-    // Read until we find \r\n\r\n (end of headers)
     while (total < buf.len) {
-        const n = reader.readSliceShort(buf[total..@min(total + 4096, buf.len)]) catch |err| {
-            if (total > 0) return buf[0..total];
-            return err;
-        };
-        if (n == 0) {
-            if (total > 0) return buf[0..total];
-            return error.EndOfStream;
-        }
-        total += n;
-
-        // Check for end of headers
-        if (findHeaderEnd(buf[0..total])) |header_end| {
-            // Parse Content-Length to know if we need more body data
-            const cl = extractContentLength(buf[0..header_end]);
-            if (cl) |body_len| {
-                const needed = header_end + 4 + body_len; // +4 for \r\n\r\n
-                while (total < needed and total < buf.len) {
-                    const more = reader.readSliceShort(buf[total..@min(needed, buf.len)]) catch |err| {
-                        _ = err;
-                        break;
-                    };
-                    if (more == 0) break;
-                    total += more;
+        const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => return total,
+            error.EndOfStream => {
+                const remaining = reader.buffered();
+                if (remaining.len > 0 and total + remaining.len <= buf.len) {
+                    @memcpy(buf[total..][0..remaining.len], remaining);
+                    total += remaining.len;
+                    reader.toss(remaining.len);
                 }
-            }
-            return buf[0..total];
+                if (total > 0) return total;
+                return error.EndOfStream;
+            },
+            error.ReadFailed => return error.ReadFailed,
+        };
+
+        if (total + line.len > buf.len) return total;
+        @memcpy(buf[total..][0..line.len], line);
+        total += line.len;
+
+        // Check if this was the blank line terminator (just \r\n)
+        if (line.len == 2 and line[0] == '\r' and line[1] == '\n') {
+            return total;
         }
     }
 
-    return buf[0..total];
+    return total;
 }
 
 /// Find the \r\n\r\n that marks the end of HTTP headers.
@@ -195,6 +214,29 @@ fn extractContentLength(headers: []const u8) ?usize {
                 const val = Request.trimOws(line[15..]);
                 return std.fmt.parseInt(usize, val, 10) catch null;
             }
+        }
+    }
+    return null;
+}
+
+/// Extract the value of a named header from raw header bytes (case-insensitive).
+fn extractHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < headers.len) {
+        const line_end = blk: {
+            var j = pos;
+            while (j + 1 < headers.len) : (j += 1) {
+                if (headers[j] == '\r' and headers[j + 1] == '\n') break :blk j;
+            }
+            break :blk headers.len;
+        };
+        const line = headers[pos..line_end];
+        pos = if (line_end + 2 <= headers.len) line_end + 2 else headers.len;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = line[0..colon];
+        if (header_name.len == name.len and Headers.eqlIgnoreCase(header_name, name)) {
+            return Request.trimOws(line[colon + 1 ..]);
         }
     }
     return null;
@@ -253,6 +295,20 @@ test "Server: init" {
 
     const srv = Server.init(.{}, handler);
     try testing.expectEqual(@as(u16, 8080), srv.config.port);
+}
+
+// RFC 2616 Section 8.2.3: extractHeaderValue for Expect header
+test "Server: extractHeaderValue" {
+    const headers = "GET / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\n\r\n";
+    const val = extractHeaderValue(headers, "expect");
+    try testing.expect(val != null);
+    try testing.expectEqualStrings("100-continue", val.?);
+}
+
+// RFC 2616 Section 8.2.3: extractHeaderValue missing
+test "Server: extractHeaderValue missing" {
+    const headers = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    try testing.expect(extractHeaderValue(headers, "expect") == null);
 }
 
 // /// asciiLowerLine utility

@@ -117,6 +117,9 @@ body: []const u8 = "",
 version: @import("Request.zig").Version = .http_1_1,
 /// When true, serialize() will auto-generate a Content-Length header.
 auto_content_length: bool = true,
+/// RFC 2616 Section 9.4: When true, serialize headers (including Content-Length)
+/// but strip the message body. Used for HEAD responses.
+strip_body: bool = false,
 
 /// Maximum response size (status line + headers + body separator)
 pub const max_response_len = 65536;
@@ -170,8 +173,10 @@ pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
     // End of headers
     pos = appendSlice(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
 
-    // Body
-    pos = appendSlice(buf, pos, self.body) orelse return error.ResponseTooLarge;
+    // RFC 2616 Section 9.4: HEAD responses MUST NOT include a body
+    if (!self.strip_body) {
+        pos = appendSlice(buf, pos, self.body) orelse return error.ResponseTooLarge;
+    }
 
     return buf[0..pos];
 }
@@ -383,6 +388,26 @@ test "Response: init helper" {
     try testing.expectEqual(StatusCode.ok, resp.status);
     try testing.expectEqualStrings("Hello", resp.body);
     try testing.expectEqualStrings("text/plain", resp.headers.get("Content-Type").?);
+}
+
+// RFC 2616 Section 9.4: HEAD response includes Content-Length but no body
+test "Response: serialize with strip_body" {
+    var resp: Response = .{
+        .status = .ok,
+        .body = "Hello",
+        .strip_body = true,
+    };
+    try resp.headers.append("Content-Type", "text/plain");
+
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serialize(&buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n",
+        result,
+    );
 }
 
 // /// formatInt utility

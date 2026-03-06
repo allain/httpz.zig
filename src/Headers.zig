@@ -56,6 +56,23 @@ pub fn getAll(self: *const Headers, name: []const u8, buf: [][]const u8) usize {
     return count;
 }
 
+/// Remove all headers with the given name (case-insensitive).
+pub fn remove(self: *Headers, name: []const u8) void {
+    var i: usize = 0;
+    while (i < self.len) {
+        if (eqlIgnoreCase(self.entries[i].name, name)) {
+            // Shift remaining entries down
+            var j = i;
+            while (j + 1 < self.len) : (j += 1) {
+                self.entries[j] = self.entries[j + 1];
+            }
+            self.len -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// RFC 2616 Section 2.2: Check if a string is a valid HTTP token.
 /// token = 1*<any CHAR except CTLs or separators>
 pub fn isValidToken(s: []const u8) bool {
@@ -170,6 +187,20 @@ test "Headers: token validation" {
     try testing.expect(!isValidToken("a(b"));
     try testing.expect(!isValidToken("a@b"));
     try testing.expect(!isValidToken("a[b"));
+}
+
+// RFC 2616 Section 13.5.1: Remove hop-by-hop headers.
+test "Headers: remove" {
+    var h: Headers = .{};
+    try h.append("Content-Type", "text/html");
+    try h.append("Connection", "keep-alive");
+    try h.append("X-Custom", "value");
+
+    h.remove("Connection");
+    try testing.expect(h.get("Connection") == null);
+    try testing.expectEqual(@as(usize, 2), h.len);
+    try testing.expectEqualStrings("text/html", h.get("Content-Type").?);
+    try testing.expectEqualStrings("value", h.get("X-Custom").?);
 }
 
 // /// RFC 2616 Section 4.2: Case-insensitive comparison utility.

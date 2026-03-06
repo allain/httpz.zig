@@ -136,7 +136,23 @@ pub fn parse(data: []const u8) ParseError!Request {
         const header_line = data[pos..header_end];
         if (header_line.len > max_header_line_len) return error.LineTooLong;
 
-        try parseHeaderLine(&request.headers, header_line);
+        // RFC 2616 Section 4.2: Header continuation lines start with SP or HTAB.
+        // LWS at start of line means this is a continuation of the previous header.
+        // We unfold by extending the previous header's value slice to include
+        // the continuation (both are slices into the same data buffer).
+        if (header_line.len > 0 and (header_line[0] == ' ' or header_line[0] == '\t')) {
+            if (request.headers.len > 0) {
+                const prev = &request.headers.entries[request.headers.len - 1];
+                // Extend the value slice to cover from original start through
+                // the end of this continuation line (including the \r\n gap,
+                // which is treated as linear whitespace per RFC 2616 §2.2).
+                const start = @intFromPtr(prev.value.ptr);
+                const end = @intFromPtr(header_line.ptr) + header_line.len;
+                prev.value = @as([*]const u8, @ptrFromInt(start))[0 .. end - start];
+            }
+        } else {
+            try parseHeaderLine(&request.headers, header_line);
+        }
         pos = header_end + 2;
     }
 
@@ -147,9 +163,15 @@ pub fn parse(data: []const u8) ParseError!Request {
         return error.MissingHostHeader;
     }
 
-    // RFC 2616 Section 4.4: Parse message body based on Content-Length or
-    // Transfer-Encoding.
-    if (request.headers.get("Content-Length")) |cl_str| {
+    // RFC 2616 Section 4.4: Message Length
+    // Rule 3: If Transfer-Encoding is present and is not "identity",
+    // it takes precedence over Content-Length.
+    const te = request.headers.get("Transfer-Encoding");
+    if (te != null and !Headers.eqlIgnoreCase(te.?, "identity")) {
+        // Chunked body data starts at pos; store raw data for later decoding.
+        // The server is responsible for calling parseChunkedBody on a mutable buffer.
+        request.body = data[pos..];
+    } else if (request.headers.get("Content-Length")) |cl_str| {
         const content_length = std.fmt.parseInt(usize, trimOws(cl_str), 10) catch
             return error.InvalidContentLength;
         if (content_length > max_body_len) return error.BodyTooLarge;
@@ -585,6 +607,67 @@ test "Request: DELETE request" {
     const req = try Request.parse(raw);
     try testing.expectEqual(Method.DELETE, req.method);
     try testing.expectEqualStrings("/resource/42", req.uri);
+}
+
+// RFC 2616 Section 4.4: Transfer-Encoding takes precedence over Content-Length
+test "Request: Transfer-Encoding precedence over Content-Length" {
+    const raw =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Content-Length: 999\r\n" ++
+        "\r\n" ++
+        "5\r\nHello\r\n0\r\n\r\n";
+
+    const req = try Request.parse(raw);
+    // Body should contain the raw chunked data, not 999 bytes
+    try testing.expect(req.body.len > 0);
+    try testing.expect(req.body.len < 999);
+}
+
+// RFC 2616 Section 4.4: Transfer-Encoding "identity" defers to Content-Length
+test "Request: Transfer-Encoding identity uses Content-Length" {
+    const raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: identity\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "Hello";
+
+    const req = try Request.parse(raw);
+    try testing.expectEqualStrings("Hello", req.body);
+}
+
+// RFC 2616 Section 4.2: Header continuation lines (LWS folding)
+test "Request: header continuation line" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Long-Header: value1\r\n" ++
+        " continued-value\r\n" ++
+        "\r\n";
+
+    const req = try Request.parse(raw);
+    const val = req.headers.get("X-Long-Header").?;
+    // The folded value should contain both parts
+    try testing.expect(std.mem.indexOf(u8, val, "value1") != null);
+    try testing.expect(std.mem.indexOf(u8, val, "continued-value") != null);
+}
+
+// RFC 2616 Section 4.2: Tab-prefixed continuation line
+test "Request: header continuation with tab" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Header: first\r\n" ++
+        "\tsecond\r\n" ++
+        "\r\n";
+
+    const req = try Request.parse(raw);
+    const val = req.headers.get("X-Header").?;
+    try testing.expect(std.mem.indexOf(u8, val, "first") != null);
+    try testing.expect(std.mem.indexOf(u8, val, "second") != null);
 }
 
 // /// RFC 2616 Section 5.1: Empty URI is invalid

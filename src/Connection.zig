@@ -3,6 +3,7 @@ const std = @import("std");
 const Request = @import("Request.zig");
 const Response = @import("Response.zig");
 const Headers = @import("Headers.zig");
+const Date = @import("Date.zig");
 
 /// RFC 2616 Section 8.1: Persistent Connections
 ///
@@ -40,7 +41,7 @@ pub fn shouldKeepAlive(request: *const Request) bool {
 /// - RFC 2616 Section 14.18: Date header (MUST be sent by origin servers)
 /// - RFC 2616 Section 14.38: Server header
 /// - RFC 2616 Section 8.1: Connection header for keep-alive management
-pub fn processRequest(request: *const Request, handler: Handler) Response {
+pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler) Response {
     // RFC 2616 Section 9.8: TRACE method echoes the request.
     if (request.method == .TRACE) {
         return handleTrace(request);
@@ -50,7 +51,11 @@ pub fn processRequest(request: *const Request, handler: Handler) Response {
 
     // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
     if (response.headers.get("Date") == null) {
-        response.headers.append("Date", "Thu, 01 Jan 1970 00:00:00 GMT") catch {};
+        const S = struct {
+            threadlocal var date_buf: [29]u8 = undefined;
+        };
+        _ = Date.formatRfc1123(timestamp, &S.date_buf);
+        response.headers.append("Date", &S.date_buf) catch {};
     }
 
     // RFC 2616 Section 14.38: Server header.
@@ -61,6 +66,16 @@ pub fn processRequest(request: *const Request, handler: Handler) Response {
     // RFC 2616 Section 8.1.2.1: Connection header.
     if (!shouldKeepAlive(request)) {
         response.headers.append("Connection", "close") catch {};
+    }
+
+    // RFC 2616 Section 9.4: HEAD must return same headers as GET but no body.
+    if (request.method == .HEAD) {
+        response.strip_body = true;
+    }
+
+    // RFC 2616 Section 3.1: Respond with HTTP/1.0 to HTTP/1.0 clients.
+    if (request.version == .http_1_0) {
+        response.version = .http_1_0;
     }
 
     // RFC 2616 Section 14.13: Content-Length is auto-generated during
@@ -209,7 +224,7 @@ test "Connection: processRequest adds Date header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(&req, testHandler);
+    const resp = processRequest(0, &req, testHandler);
     try testing.expect(resp.headers.get("Date") != null);
 }
 
@@ -220,7 +235,7 @@ test "Connection: processRequest adds Server header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(&req, testHandler);
+    const resp = processRequest(0, &req, testHandler);
     try testing.expectEqualStrings("httpz/0.1", resp.headers.get("Server").?);
 }
 
@@ -231,7 +246,7 @@ test "Connection: processRequest adds Content-Length" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(&req, testHandler);
+    const resp = processRequest(0, &req, testHandler);
     // Content-Length is auto-generated during serialization, not as a header
     try testing.expect(resp.auto_content_length);
     // Verify it appears in serialized output
@@ -248,7 +263,7 @@ test "Connection: processRequest adds Connection: close when requested" {
             "Connection: close\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(&req, testHandler);
+    const resp = processRequest(0, &req, testHandler);
     try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 
@@ -259,7 +274,7 @@ test "Connection: TRACE method echoes request" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(&req, testHandler);
+    const resp = processRequest(0, &req, testHandler);
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
     // Body should contain the echoed request
@@ -291,8 +306,39 @@ test "Connection: no Content-Length for 204 No Content" {
             return .{ .status = .no_content };
         }
     }.handle;
-    const resp = processRequest(&req, handler);
+    const resp = processRequest(0, &req, handler);
     try testing.expect(resp.headers.get("Content-Length") == null);
+}
+
+// RFC 2616 Section 9.4: HEAD responses have headers but no body.
+test "Connection: HEAD response strips body but keeps Content-Length" {
+    const req = try Request.parse(
+        "HEAD / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequest(0, &req, testHandler);
+    try testing.expect(resp.strip_body);
+    // Serialized output should have Content-Length but no body
+    var buf: [1024]u8 = undefined;
+    const serialized = try resp.serialize(&buf);
+    try testing.expect(std.mem.indexOf(u8, serialized, "Content-Length: 13\r\n") != null);
+    // Body should not appear after the header terminator
+    const header_end = std.mem.indexOf(u8, serialized, "\r\n\r\n").?;
+    try testing.expectEqual(serialized.len, header_end + 4);
+}
+
+// RFC 2616 Section 3.1: Respond with HTTP/1.0 to HTTP/1.0 clients.
+test "Connection: HTTP/1.0 version downgrade" {
+    const req = try Request.parse(
+        "GET / HTTP/1.0\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequest(0, &req, testHandler);
+    try testing.expectEqual(Request.Version.http_1_0, resp.version);
+    var buf: [1024]u8 = undefined;
+    const serialized = try resp.serialize(&buf);
+    try testing.expect(std.mem.startsWith(u8, serialized, "HTTP/1.0"));
 }
 
 // /// formatUsize utility
