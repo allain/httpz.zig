@@ -49,7 +49,8 @@ pub fn appendServer(self: *Headers, name: []const u8, value: []const u8) void {
     if (self.len >= max_headers) {
         // This should never happen — reserved slots guarantee space.
         // If it does, it means server logic is appending too many
-        // server headers. Debug builds will catch this.
+        // server headers. Log in all builds so this is never silent.
+        std.log.err("appendServer: header table full, dropping {s}", .{name});
         std.debug.assert(false);
         return;
     }

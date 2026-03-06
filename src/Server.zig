@@ -37,6 +37,10 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
     /// Maximum total request size (headers + body)
     max_request_size: usize = 1_048_576,
+    /// Maximum size for HTTP headers (before body). Limits how much data
+    /// readHeaders will consume, preventing a client from forcing a full
+    /// max_request_size read with unterminated headers.
+    max_header_size: usize = 65536,
     /// RFC 2616 Section 8.1.4: Idle connection timeout in seconds.
     /// Connections with no activity for this duration will be closed.
     /// 0 means no timeout. Requires async Io backend for enforcement.
@@ -91,14 +95,16 @@ pub fn run(self: *Server, io: Io) !void {
             continue;
         };
 
-        // Enforce connection limit
+        // Enforce connection limit atomically: increment first, then check.
+        // This avoids the TOCTOU race where concurrent accepts could both
+        // pass a load() check before either increments.
         if (self.config.max_connections > 0) {
-            const current = self.active_connections.load(.monotonic);
-            if (current >= self.config.max_connections) {
+            const prev = self.active_connections.fetchAdd(1, .acquire);
+            if (prev >= self.config.max_connections) {
+                _ = self.active_connections.fetchSub(1, .release);
                 stream.close(io);
                 continue;
             }
-            _ = self.active_connections.fetchAdd(1, .monotonic);
         }
 
         self.handleConnection(stream, io) catch |err| {
@@ -106,7 +112,7 @@ pub fn run(self: *Server, io: Io) !void {
         };
 
         if (self.config.max_connections > 0) {
-            _ = self.active_connections.fetchSub(1, .monotonic);
+            _ = self.active_connections.fetchSub(1, .release);
         }
 
         stream.close(io);
@@ -139,8 +145,10 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     defer std.heap.page_allocator.free(request_buf);
 
     while (true) {
-        // Read request headers
-        const header_len = readHeaders(&net_reader.interface, request_buf) catch |err| switch (err) {
+        // Read request headers into a sub-slice limited by max_header_size
+        // to prevent unterminated headers from consuming the full request buffer.
+        const header_limit = @min(self.config.max_header_size, request_buf.len);
+        const header_len = readHeaders(&net_reader.interface, request_buf[0..header_limit]) catch |err| switch (err) {
             error.EndOfStream => return, // Client closed connection
             error.ReadFailed => return, // Timeout or connection reset
         };
@@ -356,6 +364,14 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
         return;
     };
     defer target_stream.close(io);
+
+    // Apply read timeout to the target socket to prevent a stalled target
+    // from holding the tunnel (and connection slot) open indefinitely.
+    const tunnel_timeout = if (self.config.keep_alive_timeout_s > 0)
+        self.config.keep_alive_timeout_s
+    else
+        60;
+    setSocketTimeout(target_stream.socket.handle, tunnel_timeout);
 
     // Send 200 Connection Established to the client.
     var est_buf: [64]u8 = undefined;
@@ -578,19 +594,45 @@ fn setSocketTimeout(handle: Io.net.Socket.Handle, timeout_s: u32) void {
     };
 }
 
-/// Check if an IP address string is in a private/loopback range.
-/// Blocks: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-/// 169.254.0.0/16 (link-local), 0.0.0.0, and IPv6 loopback (::1).
+/// Check if a host string is a private/loopback target.
+/// Blocks: known loopback hostnames, IPv6 loopback variants,
+/// 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+/// 169.254.0.0/16 (link-local), and 0.0.0.0.
+///
+/// Note: This cannot protect against DNS rebinding attacks where a
+/// hostname resolves to a private IP. For full SSRF protection,
+/// the resolved IP should be checked after DNS resolution.
 fn isPrivateIp(host: []const u8) bool {
-    // IPv6 loopback
+    // Block well-known loopback/private hostnames (case-insensitive)
+    if (Headers.eqlIgnoreCase(host, "localhost")) return true;
+    if (Headers.eqlIgnoreCase(host, "localhost.localdomain")) return true;
+
+    // IPv6 loopback in various forms
     if (std.mem.eql(u8, host, "::1")) return true;
+    if (std.mem.eql(u8, host, "[::1]")) return true;
+    if (std.mem.eql(u8, host, "0:0:0:0:0:0:0:1")) return true;
+    if (std.mem.eql(u8, host, "[0:0:0:0:0:0:0:1]")) return true;
+
+    // IPv6-mapped IPv4 loopback
+    if (std.mem.startsWith(u8, host, "::ffff:") or std.mem.startsWith(u8, host, "::FFFF:")) {
+        const mapped = host[7..];
+        const mapped_octets = parseIpv4Octets(mapped) orelse return false;
+        return isPrivateOctets(mapped_octets);
+    }
+
     if (std.mem.eql(u8, host, "0.0.0.0")) return true;
 
     // Parse IPv4 octets
     const octets = parseIpv4Octets(host) orelse return false;
 
+    return isPrivateOctets(octets);
+}
+
+fn isPrivateOctets(octets: [4]u8) bool {
     // 127.0.0.0/8
     if (octets[0] == 127) return true;
+    // 0.0.0.0/8
+    if (octets[0] == 0) return true;
     // 10.0.0.0/8
     if (octets[0] == 10) return true;
     // 172.16.0.0/12
@@ -599,7 +641,6 @@ fn isPrivateIp(host: []const u8) bool {
     if (octets[0] == 192 and octets[1] == 168) return true;
     // 169.254.0.0/16 (link-local)
     if (octets[0] == 169 and octets[1] == 254) return true;
-
     return false;
 }
 
@@ -723,10 +764,21 @@ test "Server: isPrivateIp public IPs" {
     try testing.expect(!isPrivateIp("172.15.255.255"));
 }
 
-test "Server: isPrivateIp non-IP hostnames" {
+test "Server: isPrivateIp hostnames and aliases" {
+    try testing.expect(isPrivateIp("localhost"));
+    try testing.expect(isPrivateIp("LOCALHOST"));
+    try testing.expect(isPrivateIp("localhost.localdomain"));
     try testing.expect(!isPrivateIp("example.com"));
-    try testing.expect(!isPrivateIp("localhost"));
     try testing.expect(!isPrivateIp(""));
+}
+
+test "Server: isPrivateIp IPv6 variants" {
+    try testing.expect(isPrivateIp("[::1]"));
+    try testing.expect(isPrivateIp("0:0:0:0:0:0:0:1"));
+    try testing.expect(isPrivateIp("[0:0:0:0:0:0:0:1]"));
+    try testing.expect(isPrivateIp("::ffff:127.0.0.1"));
+    try testing.expect(isPrivateIp("::ffff:10.0.0.1"));
+    try testing.expect(!isPrivateIp("::ffff:8.8.8.8"));
 }
 
 test "Server: parseIpv4Octets" {

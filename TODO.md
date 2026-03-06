@@ -1,29 +1,57 @@
-# httpz - RFC 2616 Compliance Audit
+# httpz Security Hardening
 
-## Security Vulnerabilities
+## Critical
 
-### LOW Priority
+- [x] **1. Race condition in connection counting**
+  - `Server.zig:95-109`
+  - TOCTOU between `load` and `fetchAdd` lets concurrent connections bypass `max_connections`
+  - Fixed: atomic `fetchAdd` first, check result, `fetchSub` if over limit
+  - Also upgraded to `acquire`/`release` ordering
 
-- [x] **10. No Host Header Value Validation**
-  - `Request.zig:183-205`
-  - Host header now validated: rejects control chars, whitespace, invalid chars
-  - IPv4, IPv6 literals, and hostname:port all supported
+- [ ] **2. Single-threaded accept loop blocks on connection handling**
+  - `Server.zig:88-113`
+  - One slow client blocks the entire server; trivial DoS
+  - Fix: spawn connections on separate threads/async tasks
 
-- [x] **11. No Initial Request Read Timeout**
-  - `Server.zig:115-129`
-  - New `initial_read_timeout_s` config (default 30s)
-  - Prevents slowloris attacks on new connections
-  - Switches to keep_alive_timeout after first request
+## High
 
-- [x] **12. `setsockopt` Failure Ignored**
-  - `Server.zig:setSocketTimeout`
-  - Now logs warning on failure via `std.log.warn`
+- [x] **3. CONNECT tunnel has no target socket timeout**
+  - `Server.zig:350, 378-417`
+  - Target socket had no `SO_RCVTIMEO`; a malicious/stalled target blocks forever
+  - Fixed: `setSocketTimeout` applied to target socket after connect
 
-- [x] **13. Fragile `extractContentLength` Matching**
-  - `Server.zig:extractContentLength`
-  - Replaced with delegation to `extractHeaderValue` for robust matching
+- [x] **4. SSRF bypass via hostname in proxy**
+  - `Server.zig:329-338`
+  - `isPrivateIp()` only checked IP string literals, not resolved addresses
+  - Fixed: now blocks "localhost", bracketed IPv6, long-form IPv6,
+    IPv6-mapped IPv4 (`::ffff:127.0.0.1`), and `0.0.0.0/8` range
+  - Note: DNS rebinding still requires post-resolution IP check
 
-- [x] **14. `parseConst` Shared Threadlocal Buffer**
-  - `Request.zig:parseConst`
-  - Now restricted to test/debug builds via comptime check
-  - Production code must use `parse()` with a mutable buffer
+## Medium
+
+- [ ] **5. 1 MiB allocation per connection enables memory exhaustion**
+  - `Server.zig:138`
+  - 512 connections x 1 MiB = 512 MiB committed memory
+  - Fix: start with smaller buffer, grow on demand
+
+- [x] **6. CONNECT tunnel can be held open indefinitely**
+  - `Server.zig:378-417`
+  - No idle timeout on the tunnel forwarding loop
+  - Fixed: target socket gets `SO_RCVTIMEO` (shares fix with #3)
+
+## Low
+
+- [x] **7. `appendServer` silently drops headers in release builds**
+  - `Headers.zig:48-57`
+  - `std.debug.assert(false)` is a no-op in release; critical headers silently dropped
+  - Fixed: added `std.log.err` before the assert so it's visible in all builds
+
+- [x] **8. readHeaders accepts unterminated headers**
+  - `Server.zig:423-453`
+  - If headers never end with `\r\n\r\n`, the full 1 MiB buffer is consumed
+  - Fixed: new `max_header_size` config (default 64 KiB) limits header reads
+
+- [ ] **9. Chunked body read doesn't validate chunk protocol**
+  - `Server.zig:462-516`
+  - Line-by-line reading doesn't properly enforce chunk framing
+  - Malformed chunks may be silently accepted
