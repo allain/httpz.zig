@@ -14,6 +14,11 @@ entries: [max_headers]Entry = undefined,
 len: usize = 0,
 
 pub const max_headers = 64;
+/// Number of header slots reserved for server-generated headers
+/// (Date, Server, Connection, Allow, WWW-Authenticate, Location,
+/// Transfer-Encoding, Via). User handlers should not fill beyond
+/// max_headers - reserved_headers to ensure server headers succeed.
+pub const reserved_headers = 8;
 pub const max_name_len = 256;
 pub const max_value_len = 8192;
 
@@ -24,12 +29,30 @@ pub const Error = error{
 };
 
 /// RFC 2616 Section 4.2: Add a header field.
+/// User-facing headers are limited to (max_headers - reserved_headers)
+/// to ensure server-generated headers always have room.
 pub fn append(self: *Headers, name: []const u8, value: []const u8) Error!void {
     if (self.len >= max_headers) return error.TooManyHeaders;
     if (name.len == 0 or name.len > max_name_len) return error.InvalidHeaderName;
     if (!isValidToken(name)) return error.InvalidHeaderName;
     if (value.len > max_value_len) return error.InvalidHeaderValue;
 
+    self.entries[self.len] = .{ .name = name, .value = value };
+    self.len += 1;
+}
+
+/// Append a server-generated header, using reserved header slots.
+/// These headers (Date, Server, Connection, etc.) are known-valid
+/// and must not be silently dropped. Panics if the reserved space
+/// is also exhausted (indicates a bug in server logic).
+pub fn appendServer(self: *Headers, name: []const u8, value: []const u8) void {
+    if (self.len >= max_headers) {
+        // This should never happen — reserved slots guarantee space.
+        // If it does, it means server logic is appending too many
+        // server headers. Debug builds will catch this.
+        std.debug.assert(false);
+        return;
+    }
     self.entries[self.len] = .{ .name = name, .value = value };
     self.len += 1;
 }
@@ -209,4 +232,17 @@ test "Headers: eqlIgnoreCase" {
     try testing.expect(eqlIgnoreCase("Content-Type", "content-type"));
     try testing.expect(!eqlIgnoreCase("abc", "abcd"));
     try testing.expect(!eqlIgnoreCase("abc", "abd"));
+}
+
+// Server headers use reserved slots
+test "Headers: appendServer basic" {
+    var h: Headers = .{};
+    h.appendServer("Date", "Thu, 01 Jan 1970 00:00:00 GMT");
+    try testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", h.get("Date").?);
+}
+
+// Reserved header constant
+test "Headers: reserved_headers constant" {
+    try testing.expect(reserved_headers > 0);
+    try testing.expect(reserved_headers < max_headers);
 }

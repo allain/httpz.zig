@@ -2,56 +2,33 @@
 
 ## Security Vulnerabilities
 
-### HIGH Priority
-
-- [x] **1. TRACE Method Enabled by Default (XST/Credential Theft)**
-  - `Connection.zig:50-54, 138-146`
-  - TRACE echoes raw request headers (Cookie, Authorization) in response body
-  - Fix: Make TRACE off by default, configurable via `Server.Config.enable_trace`
-
-- [x] **2. No URI Validation (Path Traversal)**
-  - `Request.zig:246`
-  - URIs like `/../../../etc/passwd` or `/%2e%2e/` passed directly to handler
-  - Fix: Validate and reject URIs with path traversal patterns including
-    percent-encoded and Unicode-escaped variants
-
-- [x] **3. Incomplete Content-Length Conflict Detection (Request Smuggling)**
-  - `Request.zig:210-214`
-  - Only checks first 2 Content-Length headers; 3+ headers can bypass detection
-  - Fix: Check all Content-Length values against each other
-
-- [x] **4. Open Proxy via CONNECT (SSRF/Abuse)**
-  - `Server.zig:174-177, 216-306`
-  - No access control on CONNECT targets when `enable_proxy` is true
-  - Fix: Add proxy config with allowed ports, blocked private IPs,
-    optional authentication, target allow-lists
-
 ### MEDIUM Priority
 
-- [ ] **5. Stack-Allocated 1 MiB Request Buffer (Stack Overflow)**
+- [x] **5. Stack-Allocated 1 MiB Request Buffer (Stack Overflow)**
   - `Server.zig:85`
   - Each connection uses ~1.1 MiB stack; can overflow under load
-  - Fix: Use heap allocation
+  - Fix: Heap-allocate request buffer via `page_allocator` using `config.max_request_size`
 
-- [ ] **6. No Connection Limit (DoS)**
+- [x] **6. No Connection Limit (DoS)**
   - `Server.zig:56-68`
   - No cap on concurrent connections; slowloris vulnerable
-  - Fix: Add `max_connections` to Config with atomic counter
+  - Fix: `max_connections: u32 = 512` with `std.atomic.Value(u32)` counter
 
-- [ ] **7. Chunked Body No Per-Chunk Size Limit**
+- [x] **7. Chunked Body No Per-Chunk Size Limit**
   - `Server.zig:347-388`
   - Individual chunk sizes not validated before read attempt
-  - Fix: Validate chunk size against remaining buffer
+  - Fix: Parse and validate each chunk-size against remaining buffer space
 
-- [ ] **8. Threadlocal Buffer Lifetime (Via/Date headers)**
+- [x] **8. Threadlocal Buffer Lifetime (Via/Date headers)**
   - `Proxy.zig:36-57`, `Connection.zig:122-126`
   - Response must be serialized on same thread or data corrupts
-  - Fix: Document constraint or use caller-provided buffers
+  - Fix: Embedded `server_header_buf` in Response; Via/Date stored there
 
-- [ ] **9. Silent Error Swallowing (`catch {}`)**
+- [x] **9. Silent Error Swallowing (`catch {}`)**
   - Multiple files
   - Critical headers (Connection: close, Date) silently dropped if header slots full
-  - Fix: Reserve header slots or use `catch unreachable` for server headers
+  - Fix: `Headers.appendServer()` uses reserved slots, asserts on overflow;
+    `Headers.reserved_headers = 8` guarantees space for server headers
 
 ### LOW Priority
 

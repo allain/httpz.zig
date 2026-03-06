@@ -32,28 +32,29 @@ pub fn parseAuthority(uri: []const u8) ?Authority {
 /// Format: Via: <protocol-version> <pseudonym>
 /// If a Via header already exists, the new entry is appended as a
 /// comma-separated value to preserve the proxy chain.
-pub fn addViaHeader(headers: *Headers, version: Request.Version) void {
-    const S = struct {
-        threadlocal var via_buf: [256]u8 = undefined;
-    };
-
+///
+/// Uses the Response's embedded buffer for the composed Via value
+/// so the header slice has a well-defined lifetime.
+pub fn addViaHeader(response: *Response, version: Request.Version) void {
+    const headers = &response.headers;
     const existing = headers.get("Via");
     const via_entry: []const u8 = if (version == .http_1_1) "1.1 httpz" else "1.0 httpz";
 
     if (existing) |prev| {
         // Append to existing Via chain
-        if (prev.len + 2 + via_entry.len > S.via_buf.len) return;
+        const needed = prev.len + 2 + via_entry.len;
+        const via_buf = response.allocServerBuf(needed) orelse return;
         var pos: usize = 0;
-        @memcpy(S.via_buf[pos..][0..prev.len], prev);
+        @memcpy(via_buf[pos..][0..prev.len], prev);
         pos += prev.len;
-        @memcpy(S.via_buf[pos..][0..2], ", ");
+        @memcpy(via_buf[pos..][0..2], ", ");
         pos += 2;
-        @memcpy(S.via_buf[pos..][0..via_entry.len], via_entry);
+        @memcpy(via_buf[pos..][0..via_entry.len], via_entry);
         pos += via_entry.len;
         headers.remove("Via");
-        headers.append("Via", S.via_buf[0..pos]) catch {};
+        headers.appendServer("Via", via_buf[0..pos]);
     } else {
-        headers.append("Via", via_entry) catch {};
+        headers.appendServer("Via", via_entry);
     }
 }
 
@@ -115,29 +116,29 @@ test "Proxy: parseAuthority invalid - port overflow" {
 
 // RFC 2616 Section 14.45: Via header
 test "Proxy: addViaHeader new HTTP/1.1" {
-    var headers: Headers = .{};
-    addViaHeader(&headers, .http_1_1);
-    try testing.expectEqualStrings("1.1 httpz", headers.get("Via").?);
+    var resp: Response = .{};
+    addViaHeader(&resp, .http_1_1);
+    try testing.expectEqualStrings("1.1 httpz", resp.headers.get("Via").?);
 }
 
 test "Proxy: addViaHeader new HTTP/1.0" {
-    var headers: Headers = .{};
-    addViaHeader(&headers, .http_1_0);
-    try testing.expectEqualStrings("1.0 httpz", headers.get("Via").?);
+    var resp: Response = .{};
+    addViaHeader(&resp, .http_1_0);
+    try testing.expectEqualStrings("1.0 httpz", resp.headers.get("Via").?);
 }
 
 test "Proxy: addViaHeader appends to existing chain" {
-    var headers: Headers = .{};
-    try headers.append("Via", "1.1 upstream-proxy");
-    addViaHeader(&headers, .http_1_1);
-    try testing.expectEqualStrings("1.1 upstream-proxy, 1.1 httpz", headers.get("Via").?);
+    var resp: Response = .{};
+    try resp.headers.append("Via", "1.1 upstream-proxy");
+    addViaHeader(&resp, .http_1_1);
+    try testing.expectEqualStrings("1.1 upstream-proxy, 1.1 httpz", resp.headers.get("Via").?);
 }
 
 test "Proxy: addViaHeader appends to multi-hop chain" {
-    var headers: Headers = .{};
-    try headers.append("Via", "1.0 first, 1.1 second");
-    addViaHeader(&headers, .http_1_1);
-    try testing.expectEqualStrings("1.0 first, 1.1 second, 1.1 httpz", headers.get("Via").?);
+    var resp: Response = .{};
+    try resp.headers.append("Via", "1.0 first, 1.1 second");
+    addViaHeader(&resp, .http_1_1);
+    try testing.expectEqualStrings("1.0 first, 1.1 second, 1.1 httpz", resp.headers.get("Via").?);
 }
 
 // Connection Established response

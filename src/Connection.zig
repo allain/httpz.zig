@@ -60,7 +60,7 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
     if (request.method == .TRACE) {
         if (!options.enable_trace) {
             var response: Response = .{ .status = .method_not_allowed, .body = "Method Not Allowed" };
-            response.headers.append("Allow", default_allow_no_trace) catch {};
+            response.headers.appendServer("Allow", default_allow_no_trace);
             addStandardHeaders(&response, timestamp, request);
             return response;
         }
@@ -73,25 +73,25 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
 
     // RFC 2616 Section 10.4.6: 405 responses MUST include an Allow header.
     if (response.status == .method_not_allowed and response.headers.get("Allow") == null) {
-        response.headers.append("Allow", default_allow) catch {};
+        response.headers.appendServer("Allow", default_allow);
     }
 
     // RFC 2616 Section 10.4.2: 401 responses MUST include a WWW-Authenticate header.
     if (response.status == .unauthorized and response.headers.get("WWW-Authenticate") == null) {
-        response.headers.append("WWW-Authenticate", "Basic realm=\"httpz\"") catch {};
+        response.headers.appendServer("WWW-Authenticate", "Basic realm=\"httpz\"");
     }
 
     // RFC 2616 Section 10.2.2: 201 responses SHOULD include a Location header.
     // RFC 2616 Section 10.3.x: Redirect responses MUST include a Location header.
     if (isRedirect(response.status) and response.headers.get("Location") == null) {
-        response.headers.append("Location", "/") catch {};
+        response.headers.appendServer("Location", "/");
     }
 
     addStandardHeaders(&response, timestamp, request);
 
     // RFC 2616 Section 9.2: OPTIONS responses should include Allow header.
     if (request.method == .OPTIONS and response.headers.get("Allow") == null) {
-        response.headers.append("Allow", default_allow) catch {};
+        response.headers.appendServer("Allow", default_allow);
     }
 
     // RFC 2616 Section 13.5.1 / 14.10: Remove hop-by-hop headers from the
@@ -101,7 +101,7 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
 
     // RFC 2616 Section 8.1.2.1: Connection header.
     if (!shouldKeepAlive(request)) {
-        response.headers.append("Connection", "close") catch {};
+        response.headers.appendServer("Connection", "close");
     }
 
     // RFC 2616 Section 9.4: HEAD must return same headers as GET but no body.
@@ -135,16 +135,17 @@ fn addStandardHeaders(response: *Response, timestamp: i64, request: *const Reque
     _ = request;
     // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
     if (response.headers.get("Date") == null) {
-        const S = struct {
-            threadlocal var date_buf: [29]u8 = undefined;
-        };
-        _ = Date.formatRfc1123(timestamp, &S.date_buf);
-        response.headers.append("Date", &S.date_buf) catch {};
+        // Store the date string in the response's embedded buffer so the
+        // header value slice has a well-defined lifetime (not threadlocal).
+        if (response.allocServerBuf(29)) |date_buf| {
+            _ = Date.formatRfc1123(timestamp, date_buf[0..29]);
+            response.headers.appendServer("Date", date_buf);
+        }
     }
 
     // RFC 2616 Section 14.38: Server header.
     if (response.headers.get("Server") == null) {
-        response.headers.append("Server", "httpz/0.1") catch {};
+        response.headers.appendServer("Server", "httpz/0.1");
     }
 }
 
@@ -156,7 +157,7 @@ fn handleTrace(request: *const Request) Response {
         .status = .ok,
         .body = request.raw,
     };
-    response.headers.append("Content-Type", "message/http") catch {};
+    response.headers.appendServer("Content-Type", "message/http");
 
     return response;
 }

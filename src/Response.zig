@@ -124,6 +124,24 @@ strip_body: bool = false,
 /// instead of Content-Length.
 chunked: bool = false,
 
+/// Embedded buffer for server-generated header values (Date, Via).
+/// Avoids threadlocal storage so header value slices have a well-defined
+/// lifetime tied to the Response itself.
+server_header_buf: [max_server_header_buf]u8 = undefined,
+server_header_buf_len: usize = 0,
+
+/// 29 bytes for Date + 256 bytes for Via = 285, round up
+const max_server_header_buf = 300;
+
+/// Allocate space in the embedded buffer and return a slice.
+/// Returns null if the buffer is full.
+pub fn allocServerBuf(self: *Response, len: usize) ?[]u8 {
+    if (self.server_header_buf_len + len > max_server_header_buf) return null;
+    const start = self.server_header_buf_len;
+    self.server_header_buf_len += len;
+    return self.server_header_buf[start..][0..len];
+}
+
 /// Maximum response size (status line + headers + body separator)
 pub const max_response_len = 65536;
 
@@ -548,6 +566,21 @@ test "Response: serialize empty body includes Content-Length 0" {
             "\r\n",
         result,
     );
+}
+
+// Server header embedded buffer
+test "Response: allocServerBuf" {
+    var resp: Response = .{};
+    const buf1 = resp.allocServerBuf(29).?;
+    try testing.expectEqual(@as(usize, 29), buf1.len);
+    try testing.expectEqual(@as(usize, 29), resp.server_header_buf_len);
+
+    const buf2 = resp.allocServerBuf(100).?;
+    try testing.expectEqual(@as(usize, 100), buf2.len);
+    try testing.expectEqual(@as(usize, 129), resp.server_header_buf_len);
+
+    // Filling up should return null
+    try testing.expect(resp.allocServerBuf(max_server_header_buf) == null);
 }
 
 // /// formatInt utility

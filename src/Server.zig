@@ -41,6 +41,10 @@ pub const Config = struct {
     /// Connections with no activity for this duration will be closed.
     /// 0 means no timeout. Requires async Io backend for enforcement.
     keep_alive_timeout_s: u32 = 60,
+    /// Maximum number of concurrent connections. 0 means unlimited.
+    /// When the limit is reached, new connections are accepted and
+    /// immediately closed.
+    max_connections: u32 = 512,
     /// RFC 2616 Section 9.8: Enable TRACE method support.
     /// TRACE echoes the full request (including headers like Cookie and
     /// Authorization) back to the client. This is a security risk (XST)
@@ -56,6 +60,7 @@ pub const Config = struct {
 
 config: Config,
 handler: Connection.Handler,
+active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
 pub fn init(config: Config, handler: Connection.Handler) Server {
     return .{
@@ -81,9 +86,23 @@ pub fn run(self: *Server, io: Io) !void {
             continue;
         };
 
+        // Enforce connection limit
+        if (self.config.max_connections > 0) {
+            const current = self.active_connections.load(.monotonic);
+            if (current >= self.config.max_connections) {
+                stream.close(io);
+                continue;
+            }
+            _ = self.active_connections.fetchAdd(1, .monotonic);
+        }
+
         self.handleConnection(stream, io) catch |err| {
             std.debug.print("Connection error: {}\n", .{err});
         };
+
+        if (self.config.max_connections > 0) {
+            _ = self.active_connections.fetchSub(1, .monotonic);
+        }
 
         stream.close(io);
     }
@@ -104,11 +123,14 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     var net_reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
     var net_writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
 
-    var request_buf: [1_048_576]u8 = undefined;
+    // Heap-allocate the request buffer to avoid ~1 MiB stack usage per
+    // connection, which can cause stack overflows under concurrent load.
+    const request_buf = std.heap.page_allocator.alloc(u8, self.config.max_request_size) catch return;
+    defer std.heap.page_allocator.free(request_buf);
 
     while (true) {
         // Read request headers
-        const header_len = readHeaders(&net_reader.interface, &request_buf) catch |err| switch (err) {
+        const header_len = readHeaders(&net_reader.interface, request_buf) catch |err| switch (err) {
             error.EndOfStream => return, // Client closed connection
             error.ReadFailed => return, // Timeout or connection reset
         };
@@ -151,7 +173,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         if (te != null and Headers.eqlIgnoreCase(te.?, "chunked")) {
             // RFC 2616 Section 3.6.1: Read chunked body from stream.
             // Read chunk lines until we see the terminating "0\r\n...\r\n"
-            total = readChunkedBody(&net_reader.interface, &request_buf, total) catch |err| switch (err) {
+            total = readChunkedBody(&net_reader.interface, request_buf, total) catch |err| switch (err) {
                 error.EndOfStream => total,
                 error.ReadFailed => return error.ReadFailed,
             };
@@ -207,7 +229,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         // RFC 2616 Section 14.45: Add Via header for proxied responses.
         if (self.config.enable_proxy) {
-            Proxy.addViaHeader(&response.headers, request.version);
+            Proxy.addViaHeader(&response, request.version);
         }
 
         // Serialize and send response
@@ -418,6 +440,9 @@ fn readHeaders(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
 /// Reads chunk-size lines and chunk data until the last-chunk (0\r\n)
 /// and the trailing CRLF. Returns the total bytes in the buffer
 /// (headers + raw chunked body).
+///
+/// Each chunk-size is validated against the remaining buffer space
+/// to prevent a malicious chunk-size from causing excessive reads.
 fn readChunkedBody(reader: *Io.Reader, buf: []u8, start: usize) Io.Reader.Error!usize {
     var total = start;
 
@@ -442,7 +467,7 @@ fn readChunkedBody(reader: *Io.Reader, buf: []u8, start: usize) Io.Reader.Error!
                 return total;
             }
         } else {
-            // Check if this line is the last-chunk size line ("0\r\n")
+            // Check if this line is a chunk-size line
             if (line.len >= 2 and line[line.len - 1] == '\n' and line[line.len - 2] == '\r') {
                 const size_part = line[0 .. line.len - 2];
                 // Trim any chunk extension after ';'
@@ -453,6 +478,19 @@ fn readChunkedBody(reader: *Io.Reader, buf: []u8, start: usize) Io.Reader.Error!
                 const trimmed = Request.trimOws(size_str);
                 if (trimmed.len > 0 and isAllZeros(trimmed)) {
                     found_last_chunk = true;
+                } else if (trimmed.len > 0) {
+                    // Validate chunk size against remaining buffer.
+                    // Reject chunks that would exceed the buffer to prevent
+                    // a malicious chunk-size from causing excessive reads.
+                    const chunk_size = std.fmt.parseInt(usize, trimmed, 16) catch {
+                        // Invalid hex in chunk-size — stop reading
+                        return total;
+                    };
+                    const remaining = buf.len - total;
+                    // Need room for chunk-data + CRLF + at least "0\r\n\r\n"
+                    if (chunk_size + 2 > remaining) {
+                        return total;
+                    }
                 }
             }
         }
@@ -739,4 +777,20 @@ test "Server: Config defaults include trace disabled" {
     const cfg: Config = .{};
     try testing.expect(!cfg.enable_trace);
     try testing.expect(!cfg.enable_proxy);
+    try testing.expectEqual(@as(u32, 512), cfg.max_connections);
+}
+
+// Connection counter
+test "Server: active_connections counter" {
+    const handler = struct {
+        fn handle(_: *const Request, _: Io) Response {
+            return Response.init(.ok, "text/plain", "OK");
+        }
+    }.handle;
+    var srv = Server.init(.{}, handler);
+    try testing.expectEqual(@as(u32, 0), srv.active_connections.load(.monotonic));
+    _ = srv.active_connections.fetchAdd(1, .monotonic);
+    try testing.expectEqual(@as(u32, 1), srv.active_connections.load(.monotonic));
+    _ = srv.active_connections.fetchSub(1, .monotonic);
+    try testing.expectEqual(@as(u32, 0), srv.active_connections.load(.monotonic));
 }
