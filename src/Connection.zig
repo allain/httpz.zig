@@ -58,6 +58,11 @@ pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler)
         response.headers.append("Allow", default_allow) catch {};
     }
 
+    // RFC 2616 Section 10.4.2: 401 responses MUST include a WWW-Authenticate header.
+    if (response.status == .unauthorized and response.headers.get("WWW-Authenticate") == null) {
+        response.headers.append("WWW-Authenticate", "Basic realm=\"httpz\"") catch {};
+    }
+
     // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
     if (response.headers.get("Date") == null) {
         const S = struct {
@@ -430,6 +435,41 @@ test "Connection: hop-by-hop headers removed" {
     try testing.expect(resp.headers.get("Proxy-Authenticate") == null);
     // Regular headers should remain
     try testing.expect(resp.headers.get("Content-Type") != null);
+}
+
+// RFC 2616 Section 10.4.2: 401 responses MUST include WWW-Authenticate.
+test "Connection: 401 response includes WWW-Authenticate" {
+    const req = try Request.parse(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request) Response {
+            return .{ .status = .unauthorized, .body = "Unauthorized" };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler);
+    try testing.expect(resp.headers.get("WWW-Authenticate") != null);
+    try testing.expectEqualStrings("Basic realm=\"httpz\"", resp.headers.get("WWW-Authenticate").?);
+}
+
+// RFC 2616 Section 10.4.2: 401 with user-provided WWW-Authenticate is preserved.
+test "Connection: 401 preserves user WWW-Authenticate" {
+    const req = try Request.parse(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request) Response {
+            var resp: Response = .{ .status = .unauthorized, .body = "Unauthorized" };
+            resp.headers.append("WWW-Authenticate", "Bearer realm=\"api\"") catch {};
+            return resp;
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler);
+    try testing.expectEqualStrings("Bearer realm=\"api\"", resp.headers.get("WWW-Authenticate").?);
 }
 
 // /// formatUsize utility

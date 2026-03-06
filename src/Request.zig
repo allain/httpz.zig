@@ -350,6 +350,127 @@ pub fn matchesEtag(self: *const Request, etag: []const u8) bool {
     return std.mem.eql(u8, trimOws(inm), etag);
 }
 
+/// RFC 2616 Section 3.7.2: A multipart body part.
+pub const MultipartPart = struct {
+    headers: Headers = .{},
+    body: []const u8 = "",
+};
+
+/// RFC 2616 Section 3.7.2: Parse a multipart body into individual parts.
+/// The boundary is extracted from the Content-Type header.
+/// Returns the number of parts found and fills the provided buffer.
+pub fn parseMultipart(self: *const Request, parts: []MultipartPart) ?usize {
+    const ct = self.headers.get("Content-Type") orelse return null;
+
+    // Extract boundary from Content-Type: multipart/form-data; boundary=----xxx
+    const boundary = extractBoundary(ct) orelse return null;
+
+    return parseMultipartBody(self.body, boundary, parts);
+}
+
+fn extractBoundary(content_type: []const u8) ?[]const u8 {
+    const needle = "boundary=";
+    const idx = std.mem.indexOf(u8, content_type, needle) orelse return null;
+    const start = idx + needle.len;
+    // Boundary may be quoted
+    if (start < content_type.len and content_type[start] == '"') {
+        const end = std.mem.indexOfScalarPos(u8, content_type, start + 1, '"') orelse return null;
+        return content_type[start + 1 .. end];
+    }
+    // Unquoted: ends at whitespace, semicolon, or end of string
+    var end = start;
+    while (end < content_type.len and content_type[end] != ' ' and
+        content_type[end] != ';' and content_type[end] != '\t') : (end += 1)
+    {}
+    if (end == start) return null;
+    return content_type[start..end];
+}
+
+fn parseMultipartBody(body: []const u8, boundary: []const u8, parts: []MultipartPart) usize {
+    // Each part is delimited by "\r\n--boundary\r\n" (or "--boundary\r\n" at start)
+    // The body ends with "\r\n--boundary--\r\n"
+    var count: usize = 0;
+    var pos: usize = 0;
+
+    // Find the first boundary: "--boundary\r\n"
+    // Build delimiter: "--" + boundary
+    var delim_buf: [74]u8 = undefined; // max boundary is 70 chars per RFC
+    if (boundary.len + 2 > delim_buf.len) return 0;
+    delim_buf[0] = '-';
+    delim_buf[1] = '-';
+    @memcpy(delim_buf[2..][0..boundary.len], boundary);
+    const delim = delim_buf[0 .. boundary.len + 2];
+
+    // Skip preamble - find first boundary
+    pos = std.mem.indexOf(u8, body, delim) orelse return 0;
+    pos += delim.len;
+
+    // Check for CRLF after boundary
+    if (pos + 2 <= body.len and body[pos] == '\r' and body[pos + 1] == '\n') {
+        pos += 2;
+    } else if (pos + 2 <= body.len and body[pos] == '-' and body[pos + 1] == '-') {
+        return 0; // Immediate close: "--boundary--"
+    } else {
+        return 0;
+    }
+
+    while (count < parts.len) {
+        // Find the next boundary
+        const next = std.mem.indexOf(u8, body[pos..], delim) orelse break;
+        const part_data = body[pos .. pos + next];
+
+        // Strip trailing CRLF before the boundary
+        const part_end = if (part_data.len >= 2 and
+            part_data[part_data.len - 2] == '\r' and part_data[part_data.len - 1] == '\n')
+            part_data.len - 2
+        else
+            part_data.len;
+
+        // Parse part: headers then body separated by \r\n\r\n
+        const header_end_pos = findHeaderEnd(part_data[0..part_end]);
+        if (header_end_pos) |he| {
+            var part: MultipartPart = .{};
+            // Parse part headers
+            var hpos: usize = 0;
+            while (hpos < he) {
+                const hline_end = findCrlf(part_data, hpos) orelse break;
+                const hline = part_data[hpos..hline_end];
+                parseHeaderLine(&part.headers, hline) catch {};
+                hpos = hline_end + 2;
+            }
+            part.body = part_data[he + 4 .. part_end];
+            parts[count] = part;
+        } else {
+            // No headers, entire part is body
+            parts[count] = .{ .body = part_data[0..part_end] };
+        }
+        count += 1;
+
+        pos += next + delim.len;
+        // Check if this is the closing boundary (--boundary--)
+        if (pos + 2 <= body.len and body[pos] == '-' and body[pos + 1] == '-') {
+            break;
+        }
+        // Skip CRLF after boundary
+        if (pos + 2 <= body.len and body[pos] == '\r' and body[pos + 1] == '\n') {
+            pos += 2;
+        }
+    }
+
+    return count;
+}
+
+fn findHeaderEnd(data: []const u8) ?usize {
+    if (data.len < 4) return null;
+    var i: usize = 0;
+    while (i + 3 < data.len) : (i += 1) {
+        if (data[i] == '\r' and data[i + 1] == '\n' and data[i + 2] == '\r' and data[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return null;
+}
+
 /// Trim optional whitespace (OWS = *(SP / HTAB)) from both ends.
 /// RFC 2616 Section 2.2
 pub fn trimOws(s: []const u8) []const u8 {
@@ -374,9 +495,17 @@ fn findCrlf(data: []const u8, start: usize) ?usize {
 ///   chunk          = chunk-size [ chunk-extension ] CRLF chunk-data CRLF
 ///   chunk-size     = 1*HEX
 ///   last-chunk     = 1*("0") [ chunk-extension ] CRLF
-pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!struct { body_len: usize, consumed: usize } {
+pub const ChunkedResult = struct {
+    body_len: usize,
+    consumed: usize,
+    /// RFC 2616 Section 14.40: Trailer headers sent after the last chunk.
+    trailers: Headers = .{},
+};
+
+pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!ChunkedResult {
     var pos: usize = 0;
     var out_pos: usize = 0;
+    var result: ChunkedResult = .{ .body_len = 0, .consumed = 0 };
 
     while (true) {
         // Read chunk-size line
@@ -395,17 +524,20 @@ pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!struct { body_le
         pos = size_line_end + 2; // skip CRLF after size
 
         if (chunk_size == 0) {
-            // last-chunk: skip trailing headers and final CRLF
+            // RFC 2616 Section 14.40: Parse trailer headers after last chunk.
             while (pos + 1 < data.len) {
                 if (data[pos] == '\r' and data[pos + 1] == '\n') {
                     pos += 2;
                     break;
                 }
-                // Skip trailer header line
                 const trailer_end = findCrlf(data, pos) orelse return error.UnexpectedEndOfInput;
+                const trailer_line = data[pos..trailer_end];
+                parseHeaderLine(&result.trailers, trailer_line) catch {};
                 pos = trailer_end + 2;
             }
-            return .{ .body_len = out_pos, .consumed = pos };
+            result.body_len = out_pos;
+            result.consumed = pos;
+            return result;
         }
 
         if (out_pos + chunk_size > out.len) return error.BodyTooLarge;
@@ -664,19 +796,23 @@ test "Request: parseChunkedBody with extension" {
     try testing.expectEqual(chunked.len, result.consumed);
 }
 
-// /// RFC 2616 Section 3.6.1: Chunked with trailer headers
+// RFC 2616 Section 3.6.1 / 14.40: Chunked with trailer headers
 test "Request: parseChunkedBody with trailers" {
     const chunked =
         "3\r\n" ++
         "abc\r\n" ++
         "0\r\n" ++
-        "Trailer: value\r\n" ++
+        "X-Checksum: abc123\r\n" ++
+        "X-Timestamp: 12345\r\n" ++
         "\r\n";
 
     var out: [64]u8 = undefined;
     const result = try parseChunkedBody(chunked, &out);
     try testing.expectEqualStrings("abc", out[0..result.body_len]);
     try testing.expectEqual(chunked.len, result.consumed);
+    // RFC 2616 Section 14.40: Trailer headers are parsed
+    try testing.expectEqualStrings("abc123", result.trailers.get("X-Checksum").?);
+    try testing.expectEqualStrings("12345", result.trailers.get("X-Timestamp").?);
 }
 
 // /// RFC 2616 Section 3.6.1: Chunked with zero-length body
@@ -1014,6 +1150,56 @@ test "Request: absolute URI with port provides Host" {
 
     const req = try Request.parse(raw);
     try testing.expectEqualStrings("example.com:8080", req.headers.get("Host").?);
+}
+
+// RFC 2616 Section 3.7.2: Multipart body parsing
+test "Request: parseMultipart simple" {
+    const boundary = "----boundary";
+    const body =
+        "------boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"field1\"\r\n" ++
+        "\r\n" ++
+        "value1\r\n" ++
+        "------boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"field2\"\r\n" ++
+        "\r\n" ++
+        "value2\r\n" ++
+        "------boundary--\r\n";
+
+    const raw =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Type: multipart/form-data; boundary=" ++ boundary ++ "\r\n" ++
+        "Content-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++ "\r\n" ++
+        "\r\n" ++
+        body;
+
+    const req = try Request.parse(raw);
+    var parts: [4]MultipartPart = undefined;
+    const count = req.parseMultipart(&parts).?;
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqualStrings("value1", parts[0].body);
+    try testing.expectEqualStrings("value2", parts[1].body);
+    try testing.expectEqualStrings("form-data; name=\"field1\"", parts[0].headers.get("Content-Disposition").?);
+}
+
+// RFC 2616 Section 3.7.2: Multipart - no Content-Type
+test "Request: parseMultipart no content type" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const req = try Request.parse(raw);
+    var parts: [4]MultipartPart = undefined;
+    try testing.expect(req.parseMultipart(&parts) == null);
+}
+
+// RFC 2616 Section 3.7.2: extractBoundary
+test "Request: extractBoundary" {
+    try testing.expectEqualStrings("abc", extractBoundary("multipart/form-data; boundary=abc").?);
+    try testing.expectEqualStrings("abc", extractBoundary("multipart/form-data; boundary=\"abc\"").?);
+    try testing.expect(extractBoundary("text/plain") == null);
 }
 
 // /// RFC 2616 Section 5.1: Empty URI is invalid

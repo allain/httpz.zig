@@ -264,6 +264,19 @@ fn formatInt(value: u16, buf: *[5]u8) usize {
     return len;
 }
 
+/// RFC 2616 Section 10.3: Create a redirect response.
+/// 301 Moved Permanently, 302 Found, 307 Temporary Redirect.
+/// The Location header is REQUIRED for redirect responses (§14.30).
+pub fn redirect(status: StatusCode, location: []const u8) Response {
+    var resp: Response = .{
+        .status = status,
+        .body = status.reason(),
+    };
+    resp.headers.append("Location", location) catch {};
+    resp.headers.append("Content-Type", "text/plain") catch {};
+    return resp;
+}
+
 /// Create a simple response with status, content-type, and body.
 pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Response {
     var resp: Response = .{
@@ -445,6 +458,26 @@ test "Response: serialize with strip_body" {
             "\r\n",
         result,
     );
+}
+
+// RFC 2616 Section 10.3: Redirect response with Location header
+test "Response: redirect" {
+    const resp = Response.redirect(.moved_permanently, "/new-location");
+    try testing.expectEqual(StatusCode.moved_permanently, resp.status);
+    try testing.expectEqualStrings("/new-location", resp.headers.get("Location").?);
+    try testing.expectEqualStrings("Moved Permanently", resp.body);
+
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serialize(&buf);
+    try testing.expect(std.mem.indexOf(u8, result, "Location: /new-location\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "301 Moved Permanently") != null);
+}
+
+// RFC 2616 Section 10.3: Temporary redirect
+test "Response: temporary redirect" {
+    const resp = Response.redirect(.temporary_redirect, "https://example.com/");
+    try testing.expectEqual(StatusCode.temporary_redirect, resp.status);
+    try testing.expectEqualStrings("https://example.com/", resp.headers.get("Location").?);
 }
 
 // RFC 2616 Section 3.6.1: Chunked transfer encoding response

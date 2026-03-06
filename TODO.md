@@ -21,9 +21,11 @@
 
 ## Minor / Edge Cases
 
-- [ ] **CONNECT method** (RFC 2616 §9.9) - Tunneling for proxies (requires raw TCP forwarding)
+- [ ] **CONNECT method** (RFC 2616 §9.9) - Tunneling for proxies (requires raw TCP forwarding, not applicable for origin servers)
 - [x] **Absolute URI to Host mapping** (RFC 2616 §5.2) - Extract host from absolute URI if Host header missing
 - [x] **HTTP/1.0 version downgrade** (RFC 2616 §3.1) - Respond with HTTP/1.0 to HTTP/1.0 clients
-- [ ] **Trailer header in chunked** (RFC 2616 §14.40) - Proper trailer header handling
-- [ ] **Multipart body parsing** (RFC 2616 §3.7.2) - Requires boundary-based parsing
-- [ ] **Via header** (RFC 2616 §14.45) - For proxies
+- [x] **Trailer header in chunked** (RFC 2616 §14.40) - Parse trailer headers into ChunkedResult.trailers
+- [x] **Multipart body parsing** (RFC 2616 §3.7.2) - Parse multipart/form-data with boundary extraction
+- [x] **Redirect helper** (RFC 2616 §10.3) - `Response.redirect()` with Location header for 301/302/307
+- [x] **401 WWW-Authenticate** (RFC 2616 §10.4.2) - Auto-inject `WWW-Authenticate` header on 401 responses
+- [ ] **Via header** (RFC 2616 §14.45) - For proxies (not applicable for origin servers)
