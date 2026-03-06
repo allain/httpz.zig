@@ -21,6 +21,10 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
     /// Maximum total request size (headers + body)
     max_request_size: usize = 1_048_576,
+    /// RFC 2616 Section 8.1.4: Idle connection timeout in seconds.
+    /// Connections with no activity for this duration will be closed.
+    /// 0 means no timeout. Requires async Io backend for enforcement.
+    keep_alive_timeout_s: u32 = 60,
 };
 
 config: Config,
@@ -85,17 +89,27 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             net_writer.interface.flush() catch return;
         }
 
-        // Read body if Content-Length is present
+        // Read body based on Transfer-Encoding or Content-Length
         var total = header_len;
-        const cl = extractContentLength(request_buf[0..header_len]);
-        if (cl) |body_len| {
-            const to_read = @min(body_len, request_buf.len - total);
-            if (to_read > 0) {
-                net_reader.interface.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
-                    error.EndOfStream => {},
-                    error.ReadFailed => return error.ReadFailed,
-                };
-                total += to_read;
+        const te = extractHeaderValue(request_buf[0..header_len], "transfer-encoding");
+        if (te != null and Headers.eqlIgnoreCase(te.?, "chunked")) {
+            // RFC 2616 Section 3.6.1: Read chunked body from stream.
+            // Read chunk lines until we see the terminating "0\r\n...\r\n"
+            total = readChunkedBody(&net_reader.interface, &request_buf, total) catch |err| switch (err) {
+                error.EndOfStream => total,
+                error.ReadFailed => return error.ReadFailed,
+            };
+        } else {
+            const cl = extractContentLength(request_buf[0..header_len]);
+            if (cl) |body_len| {
+                const to_read = @min(body_len, request_buf.len - total);
+                if (to_read > 0) {
+                    net_reader.interface.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
+                        error.EndOfStream => {},
+                        error.ReadFailed => return error.ReadFailed,
+                    };
+                    total += to_read;
+                }
             }
         }
 
@@ -177,6 +191,61 @@ fn readHeaders(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
     }
 
     return total;
+}
+
+/// Read a chunked request body from the stream into the buffer.
+/// Reads chunk-size lines and chunk data until the last-chunk (0\r\n)
+/// and the trailing CRLF. Returns the total bytes in the buffer
+/// (headers + raw chunked body).
+fn readChunkedBody(reader: *Io.Reader, buf: []u8, start: usize) Io.Reader.Error!usize {
+    var total = start;
+
+    // Read lines until we find the terminating sequence.
+    // The chunked body ends with "0\r\n" followed by optional trailers and "\r\n".
+    var found_last_chunk = false;
+    while (total < buf.len) {
+        const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => return total,
+            error.EndOfStream => return if (total > start) total else error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+
+        if (total + line.len > buf.len) return total;
+        @memcpy(buf[total..][0..line.len], line);
+        total += line.len;
+
+        if (found_last_chunk) {
+            // After last-chunk, we're reading trailers. An empty line (\r\n)
+            // terminates the chunked body.
+            if (line.len == 2 and line[0] == '\r' and line[1] == '\n') {
+                return total;
+            }
+        } else {
+            // Check if this line is the last-chunk size line ("0\r\n")
+            if (line.len >= 2 and line[line.len - 1] == '\n' and line[line.len - 2] == '\r') {
+                const size_part = line[0 .. line.len - 2];
+                // Trim any chunk extension after ';'
+                const size_str = if (std.mem.indexOfScalar(u8, size_part, ';')) |semi|
+                    size_part[0..semi]
+                else
+                    size_part;
+                const trimmed = Request.trimOws(size_str);
+                if (trimmed.len > 0 and isAllZeros(trimmed)) {
+                    found_last_chunk = true;
+                }
+            }
+        }
+    }
+
+    return total;
+}
+
+fn isAllZeros(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c != '0') return false;
+    }
+    return true;
 }
 
 /// Find the \r\n\r\n that marks the end of HTTP headers.
@@ -309,6 +378,15 @@ test "Server: extractHeaderValue" {
 test "Server: extractHeaderValue missing" {
     const headers = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
     try testing.expect(extractHeaderValue(headers, "expect") == null);
+}
+
+// isAllZeros utility
+test "Server: isAllZeros" {
+    try testing.expect(isAllZeros("0"));
+    try testing.expect(isAllZeros("000"));
+    try testing.expect(!isAllZeros("01"));
+    try testing.expect(!isAllZeros("a"));
+    try testing.expect(!isAllZeros(""));
 }
 
 // /// asciiLowerLine utility

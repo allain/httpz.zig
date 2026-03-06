@@ -120,6 +120,9 @@ auto_content_length: bool = true,
 /// RFC 2616 Section 9.4: When true, serialize headers (including Content-Length)
 /// but strip the message body. Used for HEAD responses.
 strip_body: bool = false,
+/// RFC 2616 Section 3.6.1: When true, send body using chunked transfer encoding
+/// instead of Content-Length.
+chunked: bool = false,
 
 /// Maximum response size (status line + headers + body separator)
 pub const max_response_len = 65536;
@@ -157,12 +160,15 @@ pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
         pos = appendSlice(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
     }
 
-    // Auto-generate Content-Length if needed
-    if (self.auto_content_length and
+    // RFC 2616 Section 3.6.1: Chunked transfer encoding
+    if (self.chunked and self.headers.get("Transfer-Encoding") == null) {
+        pos = appendSlice(buf, pos, "Transfer-Encoding: chunked\r\n") orelse return error.ResponseTooLarge;
+    } else if (self.auto_content_length and
         self.headers.get("Content-Length") == null and
         self.headers.get("Transfer-Encoding") == null and
         self.body.len > 0)
     {
+        // Auto-generate Content-Length if needed
         var cl_buf: [20]u8 = undefined;
         const cl_str = formatUsize(self.body.len, &cl_buf);
         pos = appendSlice(buf, pos, "Content-Length: ") orelse return error.ResponseTooLarge;
@@ -175,7 +181,22 @@ pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
 
     // RFC 2616 Section 9.4: HEAD responses MUST NOT include a body
     if (!self.strip_body) {
-        pos = appendSlice(buf, pos, self.body) orelse return error.ResponseTooLarge;
+        if (self.chunked and self.body.len > 0) {
+            // RFC 2616 Section 3.6.1: Encode body as a single chunk
+            var chunk_size_buf: [20]u8 = undefined;
+            const chunk_size_str = formatHex(self.body.len, &chunk_size_buf);
+            pos = appendSlice(buf, pos, chunk_size_str) orelse return error.ResponseTooLarge;
+            pos = appendSlice(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+            pos = appendSlice(buf, pos, self.body) orelse return error.ResponseTooLarge;
+            pos = appendSlice(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+            // Last-chunk
+            pos = appendSlice(buf, pos, "0\r\n\r\n") orelse return error.ResponseTooLarge;
+        } else if (self.chunked) {
+            // Empty chunked body
+            pos = appendSlice(buf, pos, "0\r\n\r\n") orelse return error.ResponseTooLarge;
+        } else {
+            pos = appendSlice(buf, pos, self.body) orelse return error.ResponseTooLarge;
+        }
     }
 
     return buf[0..pos];
@@ -198,6 +219,22 @@ fn formatUsize(value: usize, buf: *[20]u8) []const u8 {
         i -= 1;
         buf[i] = @intCast(v % 10 + '0');
         v /= 10;
+    }
+    return buf[i..20];
+}
+
+fn formatHex(value: usize, buf: *[20]u8) []const u8 {
+    const hex_chars = "0123456789abcdef";
+    var v = value;
+    var i: usize = 20;
+    if (v == 0) {
+        buf[19] = '0';
+        return buf[19..20];
+    }
+    while (v > 0) {
+        i -= 1;
+        buf[i] = hex_chars[v & 0xf];
+        v >>= 4;
     }
     return buf[i..20];
 }
@@ -408,6 +445,60 @@ test "Response: serialize with strip_body" {
             "\r\n",
         result,
     );
+}
+
+// RFC 2616 Section 3.6.1: Chunked transfer encoding response
+test "Response: serialize chunked response" {
+    var resp: Response = .{
+        .status = .ok,
+        .body = "Hello",
+        .chunked = true,
+    };
+    try resp.headers.append("Content-Type", "text/plain");
+
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serialize(&buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\n" ++
+            "Hello\r\n" ++
+            "0\r\n" ++
+            "\r\n",
+        result,
+    );
+}
+
+// RFC 2616 Section 3.6.1: Empty chunked response
+test "Response: serialize empty chunked response" {
+    const resp: Response = .{
+        .status = .ok,
+        .chunked = true,
+    };
+
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serialize(&buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "0\r\n" ++
+            "\r\n",
+        result,
+    );
+}
+
+// formatHex utility
+test "Response: formatHex" {
+    var buf: [20]u8 = undefined;
+
+    try testing.expectEqualStrings("0", formatHex(0, &buf));
+    try testing.expectEqualStrings("5", formatHex(5, &buf));
+    try testing.expectEqualStrings("a", formatHex(10, &buf));
+    try testing.expectEqualStrings("ff", formatHex(255, &buf));
+    try testing.expectEqualStrings("100", formatHex(256, &buf));
 }
 
 // /// formatInt utility

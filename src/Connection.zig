@@ -41,6 +41,10 @@ pub fn shouldKeepAlive(request: *const Request) bool {
 /// - RFC 2616 Section 14.18: Date header (MUST be sent by origin servers)
 /// - RFC 2616 Section 14.38: Server header
 /// - RFC 2616 Section 8.1: Connection header for keep-alive management
+/// RFC 2616 Section 9.2 / 10.4.6: The Allow header lists the set of methods
+/// supported by the resource. Used in OPTIONS and 405 responses.
+pub const default_allow = "GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE, PATCH";
+
 pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler) Response {
     // RFC 2616 Section 9.8: TRACE method echoes the request.
     if (request.method == .TRACE) {
@@ -48,6 +52,11 @@ pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler)
     }
 
     var response = handler(request);
+
+    // RFC 2616 Section 10.4.6: 405 responses MUST include an Allow header.
+    if (response.status == .method_not_allowed and response.headers.get("Allow") == null) {
+        response.headers.append("Allow", default_allow) catch {};
+    }
 
     // RFC 2616 Section 14.18: Origin servers MUST include a Date header.
     if (response.headers.get("Date") == null) {
@@ -62,6 +71,15 @@ pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler)
     if (response.headers.get("Server") == null) {
         response.headers.append("Server", "httpz/0.1") catch {};
     }
+
+    // RFC 2616 Section 9.2: OPTIONS responses should include Allow header.
+    if (request.method == .OPTIONS and response.headers.get("Allow") == null) {
+        response.headers.append("Allow", default_allow) catch {};
+    }
+
+    // RFC 2616 Section 13.5.1: Remove hop-by-hop headers from the response.
+    // These headers are meaningful only for a single transport-level connection.
+    removeHopByHopHeaders(&response.headers);
 
     // RFC 2616 Section 8.1.2.1: Connection header.
     if (!shouldKeepAlive(request)) {
@@ -138,6 +156,26 @@ fn handleTrace(request: *const Request) Response {
     response.headers.append("Content-Type", "message/http") catch {};
 
     return response;
+}
+
+/// RFC 2616 Section 13.5.1: Remove hop-by-hop headers that must not be
+/// forwarded. These are meaningful only for a single transport-level
+/// connection and should not be stored by caches or forwarded by proxies.
+///
+/// Note: Connection and Transfer-Encoding are managed by the server itself,
+/// so we only strip headers that a user handler might accidentally set.
+fn removeHopByHopHeaders(headers: *Headers) void {
+    const hop_by_hop = [_][]const u8{
+        "Keep-Alive",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+        "TE",
+        "Trailers",
+        "Upgrade",
+    };
+    for (hop_by_hop) |name| {
+        headers.remove(name);
+    }
 }
 
 /// RFC 2616 Section 4.3: Certain responses MUST NOT include a message-body.
@@ -339,6 +377,59 @@ test "Connection: HTTP/1.0 version downgrade" {
     var buf: [1024]u8 = undefined;
     const serialized = try resp.serialize(&buf);
     try testing.expect(std.mem.startsWith(u8, serialized, "HTTP/1.0"));
+}
+
+// RFC 2616 Section 9.2: OPTIONS response includes Allow header.
+test "Connection: OPTIONS response includes Allow" {
+    const req = try Request.parse(
+        "OPTIONS * HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const resp = processRequest(0, &req, testHandler);
+    try testing.expect(resp.headers.get("Allow") != null);
+    const allow = resp.headers.get("Allow").?;
+    try testing.expect(std.mem.indexOf(u8, allow, "GET") != null);
+    try testing.expect(std.mem.indexOf(u8, allow, "HEAD") != null);
+    try testing.expect(std.mem.indexOf(u8, allow, "OPTIONS") != null);
+}
+
+// RFC 2616 Section 10.4.6: 405 responses MUST include Allow header.
+test "Connection: 405 response includes Allow" {
+    const req = try Request.parse(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request) Response {
+            return .{ .status = .method_not_allowed, .body = "Method Not Allowed" };
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler);
+    try testing.expect(resp.headers.get("Allow") != null);
+}
+
+// RFC 2616 Section 13.5.1: Hop-by-hop headers are removed from responses.
+test "Connection: hop-by-hop headers removed" {
+    const req = try Request.parse(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request) Response {
+            var resp = Response.init(.ok, "text/plain", "OK");
+            resp.headers.append("Keep-Alive", "timeout=5") catch {};
+            resp.headers.append("Proxy-Authenticate", "Basic") catch {};
+            return resp;
+        }
+    }.handle;
+    const resp = processRequest(0, &req, handler);
+    try testing.expect(resp.headers.get("Keep-Alive") == null);
+    try testing.expect(resp.headers.get("Proxy-Authenticate") == null);
+    // Regular headers should remain
+    try testing.expect(resp.headers.get("Content-Type") != null);
 }
 
 // /// formatUsize utility
