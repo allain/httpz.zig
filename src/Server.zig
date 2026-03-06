@@ -6,6 +6,7 @@ const Response = @import("Response.zig");
 const Connection = @import("Connection.zig");
 const Headers = @import("Headers.zig");
 const Date = @import("Date.zig");
+const Proxy = @import("Proxy.zig");
 
 /// RFC 2616 Section 1.4: HTTP/1.1 server implementation.
 ///
@@ -25,6 +26,10 @@ pub const Config = struct {
     /// Connections with no activity for this duration will be closed.
     /// 0 means no timeout. Requires async Io backend for enforcement.
     keep_alive_timeout_s: u32 = 60,
+    /// RFC 2616 Section 9.9 / 14.45: Enable proxy support.
+    /// When true, the server handles CONNECT requests for tunneling
+    /// and adds Via headers to proxied responses.
+    enable_proxy: bool = false,
 };
 
 config: Config,
@@ -134,9 +139,20 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             return;
         };
 
+        // RFC 2616 Section 9.9: Handle CONNECT for proxy tunneling.
+        if (request.method == .CONNECT and self.config.enable_proxy) {
+            self.handleConnect(stream, io, &request, &net_writer) catch return;
+            return;
+        }
+
         // Process the request
         const timestamp = Date.now(io);
-        const response = Connection.processRequest(timestamp, &request, self.handler);
+        var response = Connection.processRequest(timestamp, &request, self.handler);
+
+        // RFC 2616 Section 14.45: Add Via header for proxied responses.
+        if (self.config.enable_proxy) {
+            Proxy.addViaHeader(&response.headers, request.version);
+        }
 
         // Serialize and send response
         var resp_buf: [Response.max_response_len]u8 = undefined;
@@ -154,6 +170,106 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // RFC 2616 Section 8.1: Check if connection should persist
         if (!Connection.shouldKeepAlive(&request)) {
             return;
+        }
+    }
+}
+
+/// RFC 2616 Section 9.9: Handle CONNECT method for proxy tunneling.
+///
+/// Establishes a TCP tunnel between the client and the target authority.
+/// After sending "200 Connection Established", raw bytes are forwarded
+/// bidirectionally until either side closes the connection.
+///
+/// Note: Bidirectional forwarding uses an alternating read loop. For
+/// full-duplex tunneling (e.g., TLS), the async Io backend is recommended.
+fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *const Request, client_writer: *Io.net.Stream.Writer) !void {
+    _ = self;
+
+    const authority = Proxy.parseAuthority(request.uri) orelse {
+        const resp: Response = .{ .status = .bad_request, .body = "Invalid CONNECT authority" };
+        var resp_buf: [Response.max_response_len]u8 = undefined;
+        const resp_data = resp.serialize(&resp_buf) catch return;
+        client_writer.interface.writeAll(resp_data) catch return;
+        client_writer.interface.flush() catch return;
+        return;
+    };
+
+    // Connect to the target server.
+    const target_addr = Io.net.IpAddress.parseIp4(authority.host, authority.port) catch {
+        const resp: Response = .{ .status = .bad_gateway, .body = "Cannot resolve target" };
+        var resp_buf: [Response.max_response_len]u8 = undefined;
+        const resp_data = resp.serialize(&resp_buf) catch return;
+        client_writer.interface.writeAll(resp_data) catch return;
+        client_writer.interface.flush() catch return;
+        return;
+    };
+
+    const target_stream = Io.net.IpAddress.connect(target_addr, io, .{ .mode = .stream }) catch {
+        const resp: Response = .{ .status = .bad_gateway, .body = "Connection to target failed" };
+        var resp_buf: [Response.max_response_len]u8 = undefined;
+        const resp_data = resp.serialize(&resp_buf) catch return;
+        client_writer.interface.writeAll(resp_data) catch return;
+        client_writer.interface.flush() catch return;
+        return;
+    };
+    defer target_stream.close(io);
+
+    // Send 200 Connection Established to the client.
+    var est_buf: [64]u8 = undefined;
+    const est_resp = Proxy.connectionEstablishedResponse(&est_buf) orelse return;
+    client_writer.interface.writeAll(est_resp) catch return;
+    client_writer.interface.flush() catch return;
+
+    // Set up target reader/writer.
+    var target_read_buf: [8192]u8 = undefined;
+    var target_write_buf: [8192]u8 = undefined;
+    var target_reader = Io.net.Stream.Reader.init(target_stream, io, &target_read_buf);
+    var target_writer = Io.net.Stream.Writer.init(target_stream, io, &target_write_buf);
+
+    // Set up client reader for tunnel (reuse existing stream).
+    var tunnel_read_buf: [8192]u8 = undefined;
+    var tunnel_reader = Io.net.Stream.Reader.init(client_stream, io, &tunnel_read_buf);
+
+    // Bidirectional forwarding loop.
+    // Alternates reading from each side and forwarding to the other.
+    while (true) {
+        // Client -> Target
+        const client_data = tunnel_reader.interface.takeDelimiterInclusive(0) catch |err| switch (err) {
+            error.StreamTooLong => tunnel_reader.interface.buffered(),
+            error.EndOfStream => {
+                // Forward any remaining buffered data
+                const remaining = tunnel_reader.interface.buffered();
+                if (remaining.len > 0) {
+                    target_writer.interface.writeAll(remaining) catch break;
+                    target_writer.interface.flush() catch break;
+                }
+                break;
+            },
+            error.ReadFailed => break,
+        };
+        if (client_data.len > 0) {
+            target_writer.interface.writeAll(client_data) catch break;
+            target_writer.interface.flush() catch break;
+            tunnel_reader.interface.toss(client_data.len);
+        }
+
+        // Target -> Client
+        const target_data = target_reader.interface.takeDelimiterInclusive(0) catch |err| switch (err) {
+            error.StreamTooLong => target_reader.interface.buffered(),
+            error.EndOfStream => {
+                const remaining = target_reader.interface.buffered();
+                if (remaining.len > 0) {
+                    client_writer.interface.writeAll(remaining) catch break;
+                    client_writer.interface.flush() catch break;
+                }
+                break;
+            },
+            error.ReadFailed => break,
+        };
+        if (target_data.len > 0) {
+            client_writer.interface.writeAll(target_data) catch break;
+            client_writer.interface.flush() catch break;
+            target_reader.interface.toss(target_data.len);
         }
     }
 }

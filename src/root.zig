@@ -15,6 +15,7 @@ pub const Response = @import("Response.zig");
 pub const Headers = @import("Headers.zig");
 pub const Connection = @import("Connection.zig");
 pub const Date = @import("Date.zig");
+pub const Proxy = @import("Proxy.zig");
 
 const std = @import("std");
 
