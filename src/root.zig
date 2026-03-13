@@ -4,18 +4,15 @@
 ///
 /// Public API:
 /// - Server: TCP listener and connection manager
+/// - Client: HTTP/1.1 client
 /// - Request: HTTP request parser
 /// - Response: HTTP response builder
 /// - Headers: HTTP header storage
-/// - Connection: Per-connection logic (keep-alive, request processing)
-
-pub const Server = @import("Server.zig");
+pub const Server = @import("server/Server.zig");
+pub const Client = @import("client/Client.zig");
 pub const Request = @import("Request.zig");
 pub const Response = @import("Response.zig");
 pub const Headers = @import("Headers.zig");
-pub const Connection = @import("Connection.zig");
-pub const Date = @import("Date.zig");
-pub const Proxy = @import("Proxy.zig");
 
 const std = @import("std");
 

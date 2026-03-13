@@ -1,10 +1,10 @@
 const Server = @This();
 const std = @import("std");
 const Io = std.Io;
-const Request = @import("Request.zig");
-const Response = @import("Response.zig");
+const Request = @import("../Request.zig");
+const Response = @import("../Response.zig");
 const Connection = @import("Connection.zig");
-const Headers = @import("Headers.zig");
+const Headers = @import("../Headers.zig");
 const Date = @import("Date.zig");
 const Proxy = @import("Proxy.zig");
 
@@ -12,7 +12,6 @@ const Proxy = @import("Proxy.zig");
 ///
 /// This server uses the Zig 0.16 std.Io interface for networking,
 /// supporting both threaded and evented I/O backends.
-
 /// Proxy access control configuration.
 /// Controls which targets can be reached through CONNECT tunneling.
 pub const ProxyConfig = struct {

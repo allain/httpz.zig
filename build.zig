@@ -25,6 +25,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Client executable for testing
+    const client_exe = b.addExecutable(.{
+        .name = "httpz-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "httpz", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(client_exe);
+
     // Run step
     const run_step = b.step("run", "Run the HTTP server");
     const run_cmd = b.addRunArtifact(exe);
@@ -62,6 +76,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
         }),
+        .use_llvm = true,
+        .use_lld = true,
     });
 
     const kcov_mod = b.addSystemCommand(&.{"kcov"});
@@ -79,6 +95,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "httpz", .module = mod },
             },
         }),
+        .use_llvm = true,
+        .use_lld = true,
     });
 
     const kcov_exe = b.addSystemCommand(&.{"kcov"});

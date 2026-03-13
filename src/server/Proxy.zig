@@ -1,12 +1,11 @@
 const Proxy = @This();
 const std = @import("std");
-const Headers = @import("Headers.zig");
-const Request = @import("Request.zig");
-const Response = @import("Response.zig");
+const Headers = @import("../Headers.zig");
+const Request = @import("../Request.zig");
+const Response = @import("../Response.zig");
 
 /// RFC 2616 Section 9.9: CONNECT method for tunneling.
 /// RFC 2616 Section 14.45: Via header for proxy chains.
-
 pub const Authority = struct {
     host: []const u8,
     port: u16,

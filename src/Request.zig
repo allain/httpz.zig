@@ -1,7 +1,7 @@
 const Request = @This();
 const std = @import("std");
 const Headers = @import("Headers.zig");
-const Date = @import("Date.zig");
+const Date = @import("server/Date.zig");
 
 /// RFC 2616 Section 5: Request
 ///
@@ -9,7 +9,6 @@ const Date = @import("Date.zig");
 ///           *(( general-header | request-header | entity-header ) CRLF)
 ///           CRLF
 ///           [ message-body ]
-
 /// RFC 2616 Section 5.1.1: Method
 pub const Method = enum {
     GET,

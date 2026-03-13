@@ -1,8 +1,8 @@
 const Connection = @This();
 const std = @import("std");
-const Request = @import("Request.zig");
-const Response = @import("Response.zig");
-const Headers = @import("Headers.zig");
+const Request = @import("../Request.zig");
+const Response = @import("../Response.zig");
+const Headers = @import("../Headers.zig");
 const Date = @import("Date.zig");
 
 /// RFC 2616 Section 8.1: Persistent Connections
@@ -12,7 +12,6 @@ const Date = @import("Date.zig");
 ///
 /// HTTP/1.0 connections are non-persistent by default unless
 /// "Connection: keep-alive" is explicitly specified.
-
 pub const Handler = *const fn (*const Request, std.Io) Response;
 
 /// RFC 2616 Section 8.1.2: Overall Operation
