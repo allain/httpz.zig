@@ -4,11 +4,13 @@ const Io = std.Io;
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Headers = @import("../Headers.zig");
+const tls = @import("tls");
 
 /// RFC 2616: HTTP/1.1 Client implementation.
 ///
 /// This client uses the Zig 0.16 std.Io interface for networking,
 /// supporting both threaded and evented I/O backends.
+/// TLS support is provided by the tls.zig library.
 pub const Config = struct {
     host: []const u8,
     port: u16 = 80,
@@ -16,6 +18,8 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
     connection_timeout_s: u32 = 30,
     read_timeout_s: u32 = 60,
+    /// TLS configuration - if provided, HTTPS will be used
+    tls_config: ?tls.config.Client = null,
 };
 
 pub const Url = struct {
@@ -73,6 +77,7 @@ pub const ResponseParseError = ClientError || error{
 
 config: Config,
 stream: ?Io.net.Stream = null,
+tls_conn: ?tls.Connection = null,
 read_buf: []u8,
 write_buf: []u8,
 allocator: std.mem.Allocator,
@@ -100,11 +105,20 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
     const hostname = Io.net.HostName.init(self.config.host) catch {
         return error.ConnectionFailed;
     };
-    self.stream = hostname.connect(io, self.config.port, .{ .mode = .stream }) catch {
+    const stream = hostname.connect(io, self.config.port, .{ .mode = .stream }) catch {
         return error.ConnectionFailed;
     };
+
     if (self.config.connection_timeout_s > 0) {
-        setSocketTimeout(self.stream.?.socket.handle, self.config.connection_timeout_s);
+        setSocketTimeout(stream.socket.handle, self.config.connection_timeout_s);
+    }
+
+    if (self.config.tls_config) |tls_config| {
+        self.tls_conn = tls.clientFromStream(io, stream, tls_config) catch {
+            return error.ConnectionFailed;
+        };
+    } else {
+        self.stream = stream;
     }
 }
 
@@ -112,9 +126,14 @@ pub fn close(self: *Client) void {
     if (self.stream) |_| {
         self.stream = null;
     }
+    self.tls_conn = null;
 }
 
 pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
+    if (self.tls_conn) |*conn| {
+        return try self.requestTls(conn, method, uri, headers, body);
+    }
+
     const stream = self.stream orelse return error.ConnectionFailed;
 
     var reader = Io.net.Stream.Reader.init(stream, io, self.read_buf);
@@ -124,6 +143,146 @@ pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, h
     writer.interface.flush() catch return error.SendFailed;
 
     return try self.readResponse(&reader.interface);
+}
+
+fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
+    try self.sendRequestTls(conn, method, uri, headers, body);
+
+    const data = conn.next() catch return error.InvalidResponse;
+    const response_data = data orelse return error.InvalidResponse;
+
+    return try self.parseTlsResponse(response_data);
+}
+
+fn sendRequestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) anyerror!void {
+    var buf: [8192]u8 = undefined;
+    var pos: usize = 0;
+
+    const method_str = method.toBytes();
+    @memcpy(buf[pos..][0..method_str.len], method_str);
+    pos += method_str.len;
+    buf[pos] = ' ';
+    pos += 1;
+    @memcpy(buf[pos..][0..uri.len], uri);
+    pos += uri.len;
+    @memcpy(buf[pos..][0..11], " HTTP/1.1\r\n");
+    pos += 11;
+
+    var host_written = false;
+    if (headers) |h| {
+        for (h.entries[0..h.len]) |entry| {
+            @memcpy(buf[pos..][0..entry.name.len], entry.name);
+            pos += entry.name.len;
+            buf[pos] = ':';
+            pos += 1;
+            buf[pos] = ' ';
+            pos += 1;
+            @memcpy(buf[pos..][0..entry.value.len], entry.value);
+            pos += entry.value.len;
+            buf[pos] = '\r';
+            pos += 1;
+            buf[pos] = '\n';
+            pos += 1;
+            if (Headers.eqlIgnoreCase(entry.name, "Host")) {
+                host_written = true;
+            }
+        }
+    }
+
+    if (!host_written) {
+        @memcpy(buf[pos..][0..6], "Host: ");
+        pos += 6;
+        @memcpy(buf[pos..][0..self.config.host.len], self.config.host);
+        pos += self.config.host.len;
+        if (self.config.port != 80 and self.config.port != 443) {
+            buf[pos] = ':';
+            pos += 1;
+            var port_buf: [20]u8 = undefined;
+            const port_str = formatUsize(self.config.port, &port_buf);
+            @memcpy(buf[pos..][0..port_str.len], port_str);
+            pos += port_str.len;
+        }
+        buf[pos] = '\r';
+        pos += 1;
+        buf[pos] = '\n';
+        pos += 1;
+    }
+
+    const has_body = body != null and body.?.len > 0;
+    if (has_body) {
+        @memcpy(buf[pos..][0..16], "Content-Length: ");
+        pos += 16;
+        var cl_buf: [20]u8 = undefined;
+        const cl_str = formatUsize(body.?.len, &cl_buf);
+        @memcpy(buf[pos..][0..cl_str.len], cl_str);
+        pos += cl_str.len;
+        buf[pos] = '\r';
+        pos += 1;
+        buf[pos] = '\n';
+        pos += 1;
+    }
+
+    buf[pos] = '\r';
+    pos += 1;
+    buf[pos] = '\n';
+    pos += 1;
+
+    try conn.writeAll(buf[0..pos]);
+
+    if (has_body) {
+        try conn.writeAll(body.?);
+    }
+}
+
+fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response {
+    var response: Response = .{};
+
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.InvalidResponse;
+    const header_data = data[0..header_end];
+
+    const status_line_end = std.mem.indexOf(u8, header_data, "\r\n") orelse return error.InvalidResponse;
+    try parseStatusLine(header_data[0..status_line_end], &response);
+
+    var pos: usize = status_line_end + 2;
+    while (pos < header_end) {
+        const line_end = std.mem.indexOf(u8, header_data[pos..], "\r\n") orelse break;
+        const line = header_data[pos .. pos + line_end];
+        pos += line_end + 2;
+
+        if (line.len == 0) break;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+        const name = line[0..colon];
+        const value = Request.trimOws(line[colon + 1 ..]);
+
+        response.headers.append(name, value) catch return error.ResponseTooLarge;
+    }
+
+    const te = response.headers.get("Transfer-Encoding");
+    const is_chunked = te != null and Headers.eqlIgnoreCase(te.?, "chunked");
+
+    if (is_chunked) {
+        response.chunked = true;
+        response.body = "";
+        return response;
+    }
+
+    const cl = response.headers.get("Content-Length");
+    if (cl) |cl_str| {
+        const content_length = std.fmt.parseInt(usize, cl_str, 10) catch
+            return error.InvalidResponse;
+
+        const body_start = header_end + 4;
+        if (body_start + content_length <= data.len) {
+            const body = self.allocator.alloc(u8, content_length) catch
+                return error.ResponseTooLarge;
+            @memcpy(body, data[body_start .. body_start + content_length]);
+            response.body = body;
+            response._body_allocated = body;
+        }
+    }
+
+    return response;
 }
 
 fn sendRequest(self: *Client, writer: *Io.net.Stream.Writer, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ClientError!void {

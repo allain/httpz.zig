@@ -2,3 +2,4 @@
 zig-out/
 
 kcov-output/
+deps/

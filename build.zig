@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // TLS module
+    const tls_mod = b.addModule("tls", .{
+        .root_source_file = b.path("deps/tls/src/root.zig"),
+    });
+
     // Library module
-    const mod = b.addModule("httpz", .{
+    const httpz_mod = b.addModule("httpz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    httpz_mod.addImport("tls", tls_mod);
 
     // Executable
     const exe = b.addExecutable(.{
@@ -18,7 +24,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "httpz", .module = mod },
+                .{ .name = "httpz", .module = httpz_mod },
             },
         }),
     });
@@ -33,7 +39,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "httpz", .module = mod },
+                .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "tls", .module = tls_mod },
             },
         }),
     });
@@ -50,7 +57,7 @@ pub fn build(b: *std.Build) void {
 
     // Module tests
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = httpz_mod,
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -72,10 +79,7 @@ pub fn build(b: *std.Build) void {
 
     // Module tests cover everything via refAllDecls in root.zig
     const cov_mod_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-        }),
+        .root_module = httpz_mod,
         .use_llvm = true,
         .use_lld = true,
     });
@@ -92,7 +96,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "httpz", .module = mod },
+                .{ .name = "httpz", .module = httpz_mod },
             },
         }),
         .use_llvm = true,
