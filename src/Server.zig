@@ -67,6 +67,8 @@ pub const Config = struct {
     proxy: ProxyConfig = .{},
 };
 
+const min_initial_request_buffer_size = 16 * 1024;
+
 config: Config,
 handler: Connection.Handler,
 active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -88,6 +90,8 @@ pub fn run(self: *Server, io: Io) !void {
 
     var server = try Io.net.IpAddress.listen(addr, io, .{});
     defer server.deinit(io);
+    var connection_group: Io.Group = .init;
+    defer connection_group.cancel(io);
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -107,15 +111,10 @@ pub fn run(self: *Server, io: Io) !void {
             }
         }
 
-        self.handleConnection(stream, io) catch |err| {
-            std.debug.print("Connection error: {}\n", .{err});
+        connection_group.concurrent(io, handleConnectionTask, .{ self, stream, io }) catch {
+            rejectBusyConnection(stream, io);
+            continue;
         };
-
-        if (self.config.max_connections > 0) {
-            _ = self.active_connections.fetchSub(1, .release);
-        }
-
-        stream.close(io);
     }
 }
 
@@ -141,7 +140,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
     // Heap-allocate the request buffer to avoid ~1 MiB stack usage per
     // connection, which can cause stack overflows under concurrent load.
-    const request_buf = std.heap.page_allocator.alloc(u8, self.config.max_request_size) catch return;
+    var request_buf = std.heap.page_allocator.alloc(u8, initialRequestBufferSize(self.config)) catch return;
     defer std.heap.page_allocator.free(request_buf);
 
     while (true) {
@@ -190,15 +189,46 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         if (te != null and Headers.eqlIgnoreCase(te.?, "chunked")) {
             // RFC 2616 Section 3.6.1: Read chunked body from stream.
-            // Read chunk lines until we see the terminating "0\r\n...\r\n"
-            total = readChunkedBody(&net_reader.interface, request_buf, total) catch |err| switch (err) {
-                error.EndOfStream => total,
+            total = readChunkedBody(&net_reader.interface, &request_buf, total, self.config.max_request_size) catch |err| switch (err) {
+                error.EndOfStream => {
+                    const resp: Response = .{ .status = .bad_request, .body = "Incomplete chunked body" };
+                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    const resp_data = resp.serialize(&resp_buf) catch return;
+                    net_writer.interface.writeAll(resp_data) catch return;
+                    net_writer.interface.flush() catch return;
+                    return;
+                },
                 error.ReadFailed => return error.ReadFailed,
+                error.BodyTooLarge => {
+                    const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
+                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    const resp_data = resp.serialize(&resp_buf) catch return;
+                    net_writer.interface.writeAll(resp_data) catch return;
+                    net_writer.interface.flush() catch return;
+                    return;
+                },
+                error.InvalidChunkedEncoding => {
+                    const resp: Response = .{ .status = .bad_request, .body = "Invalid chunked body" };
+                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    const resp_data = resp.serialize(&resp_buf) catch return;
+                    net_writer.interface.writeAll(resp_data) catch return;
+                    net_writer.interface.flush() catch return;
+                    return;
+                },
             };
         } else {
             const cl = extractContentLength(request_buf[0..header_len]);
             if (cl) |body_len| {
-                const to_read = @min(body_len, request_buf.len - total);
+                if (body_len > self.config.max_request_size - header_len) {
+                    const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
+                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    const resp_data = resp.serialize(&resp_buf) catch return;
+                    net_writer.interface.writeAll(resp_data) catch return;
+                    net_writer.interface.flush() catch return;
+                    return;
+                }
+                ensureRequestCapacity(&request_buf, header_len + body_len, self.config.max_request_size) catch return;
+                const to_read = body_len;
                 if (to_read > 0) {
                     net_reader.interface.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
                         error.EndOfStream => {},
@@ -274,6 +304,32 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             setSocketTimeout(stream.socket.handle, self.config.keep_alive_timeout_s);
         }
     }
+}
+
+fn handleConnectionTask(self: *Server, stream: Io.net.Stream, io: Io) Io.Cancelable!void {
+    defer stream.close(io);
+    defer if (self.config.max_connections > 0) {
+        _ = self.active_connections.fetchSub(1, .release);
+    };
+
+    self.handleConnection(stream, io) catch |err| {
+        std.debug.print("Connection error: {}\n", .{err});
+    };
+}
+
+fn rejectBusyConnection(stream: Io.net.Stream, io: Io) void {
+    defer stream.close(io);
+
+    var write_buf: [8192]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
+    const resp: Response = .{
+        .status = .service_unavailable,
+        .body = "Server busy",
+    };
+    var resp_buf: [Response.max_response_len]u8 = undefined;
+    const resp_data = resp.serialize(&resp_buf) catch return;
+    writer.interface.writeAll(resp_data) catch return;
+    writer.interface.flush() catch return;
 }
 
 /// RFC 2616 Section 9.9: Handle CONNECT method for proxy tunneling.
@@ -468,6 +524,11 @@ fn readHeaders(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
     return total;
 }
 
+const ReadChunkedBodyError = Io.Reader.Error || error{
+    BodyTooLarge,
+    InvalidChunkedEncoding,
+};
+
 /// Read a chunked request body from the stream into the buffer.
 /// Reads chunk-size lines and chunk data until the last-chunk (0\r\n)
 /// and the trailing CRLF. Returns the total bytes in the buffer
@@ -475,60 +536,85 @@ fn readHeaders(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
 ///
 /// Each chunk-size is validated against the remaining buffer space
 /// to prevent a malicious chunk-size from causing excessive reads.
-fn readChunkedBody(reader: *Io.Reader, buf: []u8, start: usize) Io.Reader.Error!usize {
+fn readChunkedBody(reader: *Io.Reader, buf: *[]u8, start: usize, max_size: usize) ReadChunkedBodyError!usize {
     var total = start;
-
-    // Read lines until we find the terminating sequence.
-    // The chunked body ends with "0\r\n" followed by optional trailers and "\r\n".
-    var found_last_chunk = false;
-    while (total < buf.len) {
+    while (true) {
         const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.StreamTooLong => return total,
+            error.StreamTooLong => return error.InvalidChunkedEncoding,
             error.EndOfStream => return if (total > start) total else error.EndOfStream,
             error.ReadFailed => return error.ReadFailed,
         };
-
-        if (total + line.len > buf.len) return total;
-        @memcpy(buf[total..][0..line.len], line);
+        const chunk_size = parseChunkSizeLine(line) catch return error.InvalidChunkedEncoding;
+        try ensureRequestCapacity(buf, total + line.len, max_size);
+        @memcpy(buf.*[total..][0..line.len], line);
         total += line.len;
 
-        if (found_last_chunk) {
-            // After last-chunk, we're reading trailers. An empty line (\r\n)
-            // terminates the chunked body.
-            if (line.len == 2 and line[0] == '\r' and line[1] == '\n') {
-                return total;
-            }
-        } else {
-            // Check if this line is a chunk-size line
-            if (line.len >= 2 and line[line.len - 1] == '\n' and line[line.len - 2] == '\r') {
-                const size_part = line[0 .. line.len - 2];
-                // Trim any chunk extension after ';'
-                const size_str = if (std.mem.indexOfScalar(u8, size_part, ';')) |semi|
-                    size_part[0..semi]
-                else
-                    size_part;
-                const trimmed = Request.trimOws(size_str);
-                if (trimmed.len > 0 and isAllZeros(trimmed)) {
-                    found_last_chunk = true;
-                } else if (trimmed.len > 0) {
-                    // Validate chunk size against remaining buffer.
-                    // Reject chunks that would exceed the buffer to prevent
-                    // a malicious chunk-size from causing excessive reads.
-                    const chunk_size = std.fmt.parseInt(usize, trimmed, 16) catch {
-                        // Invalid hex in chunk-size — stop reading
-                        return total;
-                    };
-                    const remaining = buf.len - total;
-                    // Need room for chunk-data + CRLF + at least "0\r\n\r\n"
-                    if (chunk_size + 2 > remaining) {
-                        return total;
-                    }
+        if (chunk_size == 0) {
+            while (true) {
+                const trailer_line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                    error.StreamTooLong => return error.InvalidChunkedEncoding,
+                    error.EndOfStream => return error.InvalidChunkedEncoding,
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                if (trailer_line.len < 2 or trailer_line[trailer_line.len - 2] != '\r' or trailer_line[trailer_line.len - 1] != '\n') {
+                    return error.InvalidChunkedEncoding;
+                }
+                try ensureRequestCapacity(buf, total + trailer_line.len, max_size);
+                @memcpy(buf.*[total..][0..trailer_line.len], trailer_line);
+                total += trailer_line.len;
+                if (trailer_line.len == 2) {
+                    return total;
                 }
             }
         }
+
+        try ensureRequestCapacity(buf, total + chunk_size + 2, max_size);
+        reader.readSliceAll(buf.*[total..][0 .. chunk_size + 2]) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        if (buf.*[total + chunk_size] != '\r' or buf.*[total + chunk_size + 1] != '\n') {
+            return error.InvalidChunkedEncoding;
+        }
+        total += chunk_size + 2;
+    }
+}
+
+fn parseChunkSizeLine(line: []const u8) error{InvalidChunkedEncoding}!usize {
+    if (line.len < 2 or line[line.len - 2] != '\r' or line[line.len - 1] != '\n') {
+        return error.InvalidChunkedEncoding;
     }
 
-    return total;
+    const size_part = line[0 .. line.len - 2];
+    const size_str = if (std.mem.indexOfScalar(u8, size_part, ';')) |semi|
+        size_part[0..semi]
+    else
+        size_part;
+    const trimmed = Request.trimOws(size_str);
+    if (trimmed.len == 0) {
+        return error.InvalidChunkedEncoding;
+    }
+    return std.fmt.parseInt(usize, trimmed, 16) catch error.InvalidChunkedEncoding;
+}
+
+fn initialRequestBufferSize(config: Config) usize {
+    const target = @max(config.max_header_size, min_initial_request_buffer_size);
+    return @max(@as(usize, 1), @min(config.max_request_size, target));
+}
+
+fn ensureRequestCapacity(buf: *[]u8, needed: usize, max_size: usize) error{BodyTooLarge}!void {
+    if (needed <= buf.*.len) return;
+    if (needed > max_size) return error.BodyTooLarge;
+
+    var new_len = buf.*.len;
+    while (new_len < needed) {
+        if (new_len >= max_size) {
+            new_len = max_size;
+            break;
+        }
+        new_len = @min(max_size, if (new_len == 0) min_initial_request_buffer_size else new_len * 2);
+    }
+    buf.* = std.heap.page_allocator.realloc(buf.*, new_len) catch return error.BodyTooLarge;
 }
 
 fn isAllZeros(s: []const u8) bool {
@@ -810,6 +896,29 @@ test "Server: Config defaults include trace disabled" {
     try testing.expect(!cfg.enable_trace);
     try testing.expect(!cfg.enable_proxy);
     try testing.expectEqual(@as(u32, 512), cfg.max_connections);
+}
+
+test "Server: initialRequestBufferSize defaults to header cap" {
+    const cfg: Config = .{};
+    try testing.expectEqual(@as(usize, 65536), initialRequestBufferSize(cfg));
+}
+
+test "Server: initialRequestBufferSize respects smaller request cap" {
+    const cfg: Config = .{
+        .max_request_size = 32768,
+        .max_header_size = 65536,
+    };
+    try testing.expectEqual(@as(usize, 32768), initialRequestBufferSize(cfg));
+}
+
+test "Server: parseChunkSizeLine accepts extensions and whitespace" {
+    try testing.expectEqual(@as(usize, 10), try parseChunkSizeLine(" A ;foo=bar\r\n"));
+}
+
+test "Server: parseChunkSizeLine rejects malformed lines" {
+    try testing.expectError(error.InvalidChunkedEncoding, parseChunkSizeLine("\r\n"));
+    try testing.expectError(error.InvalidChunkedEncoding, parseChunkSizeLine("ZZ\r\n"));
+    try testing.expectError(error.InvalidChunkedEncoding, parseChunkSizeLine("1\n"));
 }
 
 // Connection counter

@@ -8,10 +8,12 @@
   - Fixed: atomic `fetchAdd` first, check result, `fetchSub` if over limit
   - Also upgraded to `acquire`/`release` ordering
 
-- [ ] **2. Single-threaded accept loop blocks on connection handling**
+- [x] **2. Single-threaded accept loop blocks on connection handling**
   - `Server.zig:88-113`
   - One slow client blocks the entire server; trivial DoS
-  - Fix: spawn connections on separate threads/async tasks
+  - Fixed: accepted sockets are now dispatched via
+    `std.Io.Group.concurrent`, so the accept loop returns immediately
+    instead of waiting for per-connection keep-alive handling
 
 ## High
 
@@ -29,10 +31,12 @@
 
 ## Medium
 
-- [ ] **5. 1 MiB allocation per connection enables memory exhaustion**
+- [x] **5. 1 MiB allocation per connection enables memory exhaustion**
   - `Server.zig:138`
   - 512 connections x 1 MiB = 512 MiB committed memory
-  - Fix: start with smaller buffer, grow on demand
+  - Fixed: request buffer now starts at a bounded header-sized allocation
+    (default 64 KiB, minimum 16 KiB) and grows on demand up to
+    `max_request_size`
 
 - [x] **6. CONNECT tunnel can be held open indefinitely**
   - `Server.zig:378-417`
@@ -51,7 +55,10 @@
   - If headers never end with `\r\n\r\n`, the full 1 MiB buffer is consumed
   - Fixed: new `max_header_size` config (default 64 KiB) limits header reads
 
-- [ ] **9. Chunked body read doesn't validate chunk protocol**
+- [x] **9. Chunked body read doesn't validate chunk protocol**
   - `Server.zig:462-516`
   - Line-by-line reading doesn't properly enforce chunk framing
   - Malformed chunks may be silently accepted
+  - Fixed: chunked reads now validate each size line, read exact chunk bytes,
+    require trailing CRLF for every chunk, and require a properly terminated
+    trailer section
