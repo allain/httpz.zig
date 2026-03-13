@@ -244,10 +244,13 @@ fn readResponse(self: *Client, reader: *Io.Reader) ResponseParseError!Response {
         if (content_length > 0) {
             const body_buf = self.allocator.alloc(u8, content_length) catch
                 return error.ResponseTooLarge;
-            errdefer self.allocator.free(body_buf);
 
-            reader.readSliceAll(body_buf) catch return error.InvalidResponse;
+            reader.readSliceAll(body_buf) catch {
+                self.allocator.free(body_buf);
+                return error.InvalidResponse;
+            };
             response.body = body_buf;
+            response._body_allocated = body_buf;
         }
     }
 
@@ -384,4 +387,30 @@ test "Client: Url.parse http with port" {
 test "Client: Url.parse no path" {
     const url = Url.parse("http://example.com").?;
     try testing.expectEqualStrings("/", url.path);
+}
+
+test "Client: download from httpbin.org" {
+    const test_url = Url.parse("http://httpbin.org/html").?;
+
+    var client = Client.init(std.testing.allocator, .{
+        .host = test_url.host,
+        .port = test_url.port,
+        .connection_timeout_s = 10,
+        .read_timeout_s = 10,
+    });
+    defer client.deinit();
+
+    const io = std.testing.io;
+    try client.connect(io);
+
+    var resp = try client.request(io, .GET, test_url.path, null, null);
+    defer resp.deinit(std.testing.allocator);
+
+    try testing.expectEqual(Response.StatusCode.ok, resp.status);
+
+    const content_type = resp.headers.get("Content-Type");
+    try testing.expect(content_type != null);
+    try testing.expect(std.mem.indexOf(u8, content_type.?, "text/html") != null);
+
+    try testing.expect(resp.body.len > 0);
 }

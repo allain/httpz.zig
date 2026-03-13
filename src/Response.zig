@@ -8,7 +8,6 @@ const Headers = @import("Headers.zig");
 ///            *(( general-header | response-header | entity-header ) CRLF)
 ///            CRLF
 ///            [ message-body ]
-
 /// RFC 2616 Section 6.1.1: Status Code and Reason Phrase
 pub const StatusCode = enum(u16) {
     // 1xx Informational (RFC 2616 Section 10.1)
@@ -114,6 +113,8 @@ pub const StatusCode = enum(u16) {
 status: StatusCode = .ok,
 headers: Headers = .{},
 body: []const u8 = "",
+/// Internal: if non-null, the body was dynamically allocated and should be freed
+_body_allocated: ?[]u8 = null,
 version: @import("Request.zig").Version = .http_1_1,
 /// When true, serialize() will auto-generate a Content-Length header.
 auto_content_length: bool = true,
@@ -305,6 +306,15 @@ pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Resp
     return resp;
 }
 
+/// Free any allocated body memory.
+pub fn deinit(resp: *Response, allocator: std.mem.Allocator) void {
+    if (resp._body_allocated) |allocated| {
+        allocator.free(allocated);
+        resp.body = "";
+        resp._body_allocated = null;
+    }
+}
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -441,8 +451,8 @@ test "Response: serialize HTTP/1.0 response" {
 // /// RFC 2616 Section 6.1.1: All status code families
 test "Response: status codes from all families" {
     const codes: []const StatusCode = &.{
-        .@"continue",           .ok,               .moved_permanently,
-        .bad_request,           .internal_server_error,
+        .@"continue", .ok,                    .moved_permanently,
+        .bad_request, .internal_server_error,
     };
     for (codes) |code| {
         const resp: Response = .{ .status = code };
