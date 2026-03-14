@@ -17,13 +17,13 @@ pub fn init(comptime config: Config) type {
     return struct {
         pub fn wrap(comptime inner: Router.RouteHandler) Router.RouteHandler {
             return struct {
-                fn handle(req: *const Request, params: *const Router.Params, io: std.Io) Response {
+                fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request, params: *const Router.Params) Response {
                     // Handle OPTIONS preflight
                     if (req.method == .OPTIONS) {
                         return preflightResponse();
                     }
 
-                    var resp = inner(req, params, io);
+                    var resp = inner(allocator, io, req, params);
                     addCorsHeaders(&resp);
                     return resp;
                 }
@@ -32,12 +32,12 @@ pub fn init(comptime config: Config) type {
 
         pub fn wrapAll(comptime inner: Connection.Handler) Connection.Handler {
             return struct {
-                fn handle(req: *const Request, io: std.Io) Response {
+                fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
                     if (req.method == .OPTIONS) {
                         return preflightResponse();
                     }
 
-                    var resp = inner(req, io);
+                    var resp = inner(allocator, io, req);
                     addCorsHeaders(&resp);
                     return resp;
                 }
@@ -69,7 +69,7 @@ const testing = std.testing;
 test "CORS middleware: adds headers to response" {
     const Cors = init(.{});
     const inner = struct {
-        fn h(_: *const Request, _: *const Router.Params, _: std.Io) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
             return Response.init(.ok, "application/json", "{\"ok\":true}");
         }
     }.h;
@@ -84,7 +84,7 @@ test "CORS middleware: adds headers to response" {
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
     var params: Router.Params = .{};
 
-    const resp = wrapped(&req, &params, test_io);
+    const resp = wrapped(std.testing.allocator, test_io, &req, &params);
     try testing.expectEqualStrings("*", resp.headers.get("Access-Control-Allow-Origin").?);
     try testing.expect(resp.headers.get("Access-Control-Allow-Methods") != null);
     try testing.expect(resp.headers.get("Access-Control-Allow-Headers") != null);
@@ -93,7 +93,7 @@ test "CORS middleware: adds headers to response" {
 test "CORS middleware: handles OPTIONS preflight" {
     const Cors = init(.{ .origin = "https://example.com" });
     const inner = struct {
-        fn h(_: *const Request, _: *const Router.Params, _: std.Io) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
             return Response.init(.ok, "text/plain", "should not reach here");
         }
     }.h;
@@ -108,7 +108,7 @@ test "CORS middleware: handles OPTIONS preflight" {
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
     var params: Router.Params = .{};
 
-    const resp = wrapped(&req, &params, test_io);
+    const resp = wrapped(std.testing.allocator, test_io, &req, &params);
     try testing.expectEqual(Response.StatusCode.no_content, resp.status);
     try testing.expectEqualStrings("https://example.com", resp.headers.get("Access-Control-Allow-Origin").?);
     try testing.expect(resp.headers.get("Access-Control-Max-Age") != null);
@@ -123,7 +123,7 @@ test "CORS middleware: custom config" {
     });
 
     const inner = struct {
-        fn h(_: *const Request, _: *const Router.Params, _: std.Io) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
             return Response.init(.ok, "text/plain", "ok");
         }
     }.h;
@@ -137,7 +137,7 @@ test "CORS middleware: custom config" {
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
     var params: Router.Params = .{};
 
-    const resp = wrapped(&req, &params, test_io);
+    const resp = wrapped(std.testing.allocator, test_io, &req, &params);
     try testing.expectEqualStrings("https://myapp.com", resp.headers.get("Access-Control-Allow-Origin").?);
     try testing.expectEqualStrings("GET, POST", resp.headers.get("Access-Control-Allow-Methods").?);
     try testing.expectEqualStrings("X-Custom-Header", resp.headers.get("Access-Control-Allow-Headers").?);

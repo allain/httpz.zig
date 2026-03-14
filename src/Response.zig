@@ -337,31 +337,6 @@ pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
     }
 }
 
-const Compression = @import("server/Compression.zig");
-
-/// Gzip-compress the response body in place.
-/// Sets Content-Encoding and Vary headers. If compression fails or
-/// produces a larger result, the response is left unchanged.
-/// The compressed body is heap-allocated and freed by `deinit()`.
-/// The server calls `deinit()` automatically after sending.
-pub fn gzip(self: *Response) void {
-    if (self.body.len == 0) return;
-    if (self.headers.get("Content-Encoding") != null) return;
-
-    const compressed = Compression.compress(self.body, std.heap.page_allocator) catch return;
-    if (compressed.len >= self.body.len) {
-        std.heap.page_allocator.free(compressed);
-        return;
-    }
-
-    // Free any previous allocation before replacing
-    self.deinit(std.heap.page_allocator);
-    self.body = compressed;
-    self._body_allocated = compressed;
-    self.headers.append("Content-Encoding", "gzip") catch {};
-    self.headers.append("Vary", "Accept-Encoding") catch {};
-}
-
 /// Context for the sendFile stream function.
 const SendFileContext = struct {
     file: std.fs.File,
@@ -873,31 +848,6 @@ test "Response: multipartByteRanges" {
     // Body should contain both parts
     try testing.expect(std.mem.indexOf(u8, resp.body, "Hello") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "World") != null);
-}
-
-// Response.gzip compresses body in place
-test "Response: gzip compresses body" {
-    // Use a body large enough that gzip actually shrinks it
-    const body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    var resp = Response.init(.ok, "text/plain", body);
-    resp.gzip();
-    defer resp.deinit(std.heap.page_allocator);
-
-    try testing.expect(resp.body.len < body.len);
-    try testing.expectEqualStrings("gzip", resp.headers.get("Content-Encoding").?);
-    try testing.expectEqualStrings("Accept-Encoding", resp.headers.get("Vary").?);
-    try testing.expect(resp._body_allocated != null);
-}
-
-// Response.gzip is a no-op on empty body
-test "Response: gzip no-op on empty body" {
-    var resp = Response.init(.ok, "text/plain", "");
-    resp.gzip();
-    try testing.expectEqualStrings("", resp.body);
-    try testing.expect(resp.headers.get("Content-Encoding") == null);
 }
 
 // serializeHeaders returns only status line + headers + CRLF

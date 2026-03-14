@@ -5,7 +5,7 @@ const testing = std.testing;
 
 // ─── Test Handlers ──────────────────────────────────────────────
 
-fn plainHandler(request: *const httpz.Request, _: std.Io) httpz.Response {
+fn plainHandler(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
     if (std.mem.eql(u8, request.uri, "/")) {
         return httpz.Response.init(.ok, "text/plain", "Hello, World!");
     }
@@ -25,14 +25,12 @@ fn plainHandler(request: *const httpz.Request, _: std.Io) httpz.Response {
         return .{ .status = .no_content };
     }
     if (std.mem.eql(u8, request.uri, "/gzip")) {
-        var resp = httpz.Response.init(.ok, "text/plain",
+        return httpz.Response.init(.ok, "text/plain",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
-        if (request.acceptsEncoding("gzip")) resp.gzip();
-        return resp;
     }
     return httpz.Response.init(.not_found, "text/plain", "Not Found");
 }
@@ -48,21 +46,21 @@ const router_handler = httpz.Router.handler(&.{
     .{ .method = .GET, .path = "/ws", .handler = routeWsUpgrade, .ws = .{ .handler = wsEchoHandler } },
 });
 
-fn routeHome(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     return httpz.Response.init(.ok, "text/html", "<h1>Home</h1>");
 }
 
-fn routeUser(_: *const httpz.Request, params: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeUser(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, params: *const httpz.Router.Params) httpz.Response {
     const id = params.get("id") orelse
         return httpz.Response.init(.bad_request, "text/plain", "Missing id");
     return httpz.Response.init(.ok, "text/plain", id);
 }
 
-fn routeCreateUser(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeCreateUser(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     return httpz.Response.init(.created, "application/json", "{\"id\":1}");
 }
 
-fn routeCompressed(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeCompressed(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     return httpz.Response.init(.ok, "text/plain",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
@@ -71,7 +69,7 @@ fn routeCompressed(_: *const httpz.Request, _: *const httpz.Router.Params, _: st
     );
 }
 
-fn routeStreamChunks(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeStreamChunks(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok, .chunked = true };
     resp.headers.append("Content-Type", "text/plain") catch {};
     resp.stream_fn = streamChunksFn;
@@ -87,7 +85,7 @@ fn streamChunksFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
     }
 }
 
-fn routeStreamEvents(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeStreamEvents(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok };
     resp.headers.append("Content-Type", "text/event-stream") catch {};
     resp.headers.append("Cache-Control", "no-cache") catch {};
@@ -105,7 +103,7 @@ fn streamEventsFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
     }
 }
 
-fn routeStreamLarge(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeStreamLarge(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok, .chunked = true };
     resp.headers.append("Content-Type", "text/plain") catch {};
     resp.stream_fn = streamLargeFn;
@@ -120,7 +118,7 @@ fn streamLargeFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
     }
 }
 
-fn routeWsUpgrade(request: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+fn routeWsUpgrade(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
     return httpz.WebSocket.upgradeResponse(request) orelse
         httpz.Response.init(.bad_request, "text/plain", "WebSocket upgrade required");
 }
@@ -156,7 +154,7 @@ var router_started = std.atomic.Value(bool).init(false);
 
 fn ensurePlainServer() void {
     if (plain_started.cmpxchgStrong(false, true, .seq_cst, .seq_cst) == null) {
-        spawnServer(plainHandler, plain_port);
+        spawnServer(comptime httpz.middleware.compression.wrapAll(plainHandler), plain_port);
     }
     waitForPort(plain_port);
 }
@@ -168,7 +166,7 @@ fn ensureRouterServer() void {
     waitForPort(router_port);
 }
 
-fn spawnServer(comptime handler: *const fn (*const httpz.Request, std.Io) httpz.Response, port: u16) void {
+fn spawnServer(comptime handler: *const fn (std.mem.Allocator, std.Io, *const httpz.Request) httpz.Response, port: u16) void {
     const T = struct {
         fn run(p: u16) void {
             var threaded = Io.Threaded.init(std.heap.page_allocator, .{});

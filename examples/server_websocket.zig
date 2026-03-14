@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn handler(request: *const httpz.Request, _: std.Io) httpz.Response {
+fn handler(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
     if (std.mem.eql(u8, request.uri, "/ws")) {
         // Attempt WebSocket upgrade
         return httpz.WebSocket.upgradeResponse(request) orelse

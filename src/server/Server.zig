@@ -360,9 +360,14 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             return;
         }
 
+        // Per-request arena allocator — freed after the response cycle completes.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const request_allocator = arena.allocator();
+
         // Process the request
         const timestamp = Date.now(io);
-        var response = Connection.processRequestWithOptions(timestamp, &request, self.handler, io, .{
+        var response = Connection.processRequestWithOptions(request_allocator, io, timestamp, &request, self.handler, .{
             .enable_trace = self.config.enable_trace,
         });
 
@@ -393,7 +398,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             // Final flush
             writer.flush() catch return;
             if (tls_conn != null) net_writer.interface.flush() catch return;
-            response.deinit(std.heap.page_allocator);
+            response.deinit(request_allocator);
             // Streaming responses don't keep-alive (simplicity)
             return;
         }
@@ -413,7 +418,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         if (tls_conn != null) net_writer.interface.flush() catch return;
 
         // Free any allocated body (e.g. from gzip compression)
-        response.deinit(std.heap.page_allocator);
+        response.deinit(request_allocator);
 
         // RFC 6455: WebSocket upgrade — hand off to WebSocket handler
         // Per-route ws_handler (from Router) takes precedence over global config.
@@ -923,7 +928,7 @@ test "Server: extractContentLength missing" {
 // /// Server init
 test "Server: init" {
     const handler = struct {
-        fn handle(_: *const Request, _: Io) Response {
+        fn handle(_: std.mem.Allocator, _: Io, _: *const Request) Response {
             return Response.init(.ok, "text/plain", "OK");
         }
     }.handle;
@@ -1055,7 +1060,7 @@ test "Server: parseChunkSizeLine rejects malformed lines" {
 // Connection counter
 test "Server: active_connections counter" {
     const handler = struct {
-        fn handle(_: *const Request, _: Io) Response {
+        fn handle(_: std.mem.Allocator, _: Io, _: *const Request) Response {
             return Response.init(.ok, "text/plain", "OK");
         }
     }.handle;

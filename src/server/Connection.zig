@@ -12,7 +12,7 @@ const Date = @import("Date.zig");
 ///
 /// HTTP/1.0 connections are non-persistent by default unless
 /// "Connection: keep-alive" is explicitly specified.
-pub const Handler = *const fn (*const Request, std.Io) Response;
+pub const Handler = *const fn (std.mem.Allocator, std.Io, *const Request) Response;
 
 /// RFC 2616 Section 8.1.2: Overall Operation
 /// Determine if the connection should be kept alive.
@@ -49,11 +49,11 @@ pub const ProcessOptions = struct {
     enable_trace: bool = false,
 };
 
-pub fn processRequest(timestamp: i64, request: *const Request, handler: Handler, io: std.Io) Response {
-    return processRequestWithOptions(timestamp, request, handler, io, .{});
+pub fn processRequest(allocator: std.mem.Allocator, io: std.Io, timestamp: i64, request: *const Request, handler: Handler) Response {
+    return processRequestWithOptions(allocator, io, timestamp, request, handler, .{});
 }
 
-pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handler: Handler, io: std.Io, options: ProcessOptions) Response {
+pub fn processRequestWithOptions(allocator: std.mem.Allocator, io: std.Io, timestamp: i64, request: *const Request, handler: Handler, options: ProcessOptions) Response {
     // RFC 2616 Section 9.8: TRACE method echoes the request.
     // Disabled by default to prevent Cross-Site Tracing (XST) attacks.
     if (request.method == .TRACE) {
@@ -68,7 +68,7 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
         return response;
     }
 
-    var response = handler(request, io);
+    var response = handler(allocator, io, request);
 
     // RFC 2616 Section 10.4.6: 405 responses MUST include an Allow header.
     if (response.status == .method_not_allowed and response.headers.get("Allow") == null) {
@@ -263,15 +263,11 @@ const testing = std.testing;
 
 const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
 
-fn testHandler(request: *const Request, io: std.Io) Response {
-    _ = request;
-    _ = io;
+fn testHandler(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
     return Response.init(.ok, "text/plain", "Hello, World!");
 }
 
-fn notFoundHandler(request: *const Request, io: std.Io) Response {
-    _ = request;
-    _ = io;
+fn notFoundHandler(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
     return Response.init(.not_found, "text/plain", "Not Found");
 }
 
@@ -323,7 +319,7 @@ test "Connection: processRequest adds Date header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expect(resp.headers.get("Date") != null);
 }
 
@@ -334,7 +330,7 @@ test "Connection: processRequest adds Server header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expectEqualStrings("httpz/0.1", resp.headers.get("Server").?);
 }
 
@@ -345,7 +341,7 @@ test "Connection: processRequest adds Content-Length" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     // Content-Length is auto-generated during serialization, not as a header
     try testing.expect(resp.auto_content_length);
     // Verify it appears in serialized output
@@ -362,7 +358,7 @@ test "Connection: processRequest adds Connection: close when requested" {
             "Connection: close\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 
@@ -373,7 +369,7 @@ test "Connection: TRACE method echoes request" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
+    const resp = processRequestWithOptions(std.testing.allocator, test_io, 0, &req, testHandler, .{ .enable_trace = true });
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
     // Body should contain the echoed request
@@ -389,7 +385,7 @@ test "Connection: TRACE response includes Date header" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
+    const resp = processRequestWithOptions(std.testing.allocator, test_io, 0, &req, testHandler, .{ .enable_trace = true });
     try testing.expect(resp.headers.get("Date") != null);
     try testing.expect(resp.headers.get("Server") != null);
 }
@@ -413,11 +409,11 @@ test "Connection: no Content-Length for 204 No Content" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .no_content };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("Content-Length") == null);
 }
 
@@ -429,11 +425,11 @@ test "Connection: 204 response body is stripped" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .no_content, .body = "should be stripped" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.strip_body);
     try testing.expectEqualStrings("", resp.body);
 }
@@ -446,11 +442,11 @@ test "Connection: 304 response body is stripped" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .not_modified, .body = "should be stripped" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.strip_body);
     try testing.expectEqualStrings("", resp.body);
     var buf: [1024]u8 = undefined;
@@ -465,7 +461,7 @@ test "Connection: HEAD response strips body but keeps Content-Length" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expect(resp.strip_body);
     // Serialized output should have Content-Length but no body
     var buf: [1024]u8 = undefined;
@@ -482,7 +478,7 @@ test "Connection: HTTP/1.0 version downgrade" {
         "GET / HTTP/1.0\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expectEqual(Request.Version.http_1_0, resp.version);
     var buf: [1024]u8 = undefined;
     const serialized = try resp.serialize(&buf);
@@ -496,11 +492,11 @@ test "Connection: chunked disabled for HTTP/1.0 clients" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .ok, .body = "chunked body", .chunked = true };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(!resp.chunked);
     try testing.expect(resp.auto_content_length);
     try testing.expectEqual(Request.Version.http_1_0, resp.version);
@@ -513,7 +509,7 @@ test "Connection: OPTIONS response includes Allow" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequest(0, &req, testHandler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, testHandler);
     try testing.expect(resp.headers.get("Allow") != null);
     const allow = resp.headers.get("Allow").?;
     try testing.expect(std.mem.indexOf(u8, allow, "GET") != null);
@@ -529,11 +525,11 @@ test "Connection: 405 response includes Allow" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .method_not_allowed, .body = "Method Not Allowed" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("Allow") != null);
 }
 
@@ -545,7 +541,7 @@ test "Connection: hop-by-hop headers removed" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp = Response.init(.ok, "text/plain", "OK");
             resp.headers.append("Keep-Alive", "timeout=5") catch {};
             resp.headers.append("Proxy-Authenticate", "Basic") catch {};
@@ -553,7 +549,7 @@ test "Connection: hop-by-hop headers removed" {
             return resp;
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("Keep-Alive") == null);
     try testing.expect(resp.headers.get("Proxy-Authenticate") == null);
     try testing.expect(resp.headers.get("Transfer-Encoding") == null);
@@ -570,14 +566,14 @@ test "Connection: custom hop-by-hop headers from Connection field removed" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp = Response.init(.ok, "text/plain", "OK");
             resp.headers.append("X-Custom-Hop", "should-be-removed") catch {};
             resp.headers.append("X-Regular", "should-remain") catch {};
             return resp;
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("X-Custom-Hop") == null);
     try testing.expectEqualStrings("should-remain", resp.headers.get("X-Regular").?);
 }
@@ -590,11 +586,11 @@ test "Connection: 401 response includes WWW-Authenticate" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .unauthorized, .body = "Unauthorized" };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("WWW-Authenticate") != null);
     try testing.expectEqualStrings("Basic realm=\"httpz\"", resp.headers.get("WWW-Authenticate").?);
 }
@@ -607,13 +603,13 @@ test "Connection: 401 preserves user WWW-Authenticate" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp: Response = .{ .status = .unauthorized, .body = "Unauthorized" };
             resp.headers.append("WWW-Authenticate", "Bearer realm=\"api\"") catch {};
             return resp;
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expectEqualStrings("Bearer realm=\"api\"", resp.headers.get("WWW-Authenticate").?);
 }
 
@@ -625,11 +621,11 @@ test "Connection: redirect response gets default Location" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return .{ .status = .moved_permanently };
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.headers.get("Location") != null);
 }
 
@@ -641,11 +637,11 @@ test "Connection: redirect preserves user Location" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return Response.redirect(.found, "/new-page");
         }
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expectEqualStrings("/new-page", resp.headers.get("Location").?);
 }
 
@@ -668,7 +664,7 @@ test "Connection: TRACE disabled by default returns 405" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = false });
+    const resp = processRequestWithOptions(std.testing.allocator, test_io, 0, &req, testHandler, .{ .enable_trace = false });
     try testing.expectEqual(Response.StatusCode.method_not_allowed, resp.status);
     try testing.expect(resp.headers.get("Allow") != null);
     // Should not contain TRACE in allowed methods
@@ -683,7 +679,7 @@ test "Connection: TRACE works when enabled" {
             "Host: example.com\r\n" ++
             "\r\n",
     );
-    const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
+    const resp = processRequestWithOptions(std.testing.allocator, test_io, 0, &req, testHandler, .{ .enable_trace = true });
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
 }
@@ -696,14 +692,14 @@ test "Connection: HEAD nulls stream_fn" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp: Response = .{ .status = .ok, .chunked = true };
             resp.stream_fn = dummyStreamFn;
             return resp;
         }
         fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.stream_fn == null);
     try testing.expect(resp.strip_body);
 }
@@ -716,14 +712,14 @@ test "Connection: 204 nulls stream_fn" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp: Response = .{ .status = .no_content };
             resp.stream_fn = dummyStreamFn;
             return resp;
         }
         fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.stream_fn == null);
 }
 
@@ -735,14 +731,14 @@ test "Connection: streaming auto-chunked" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp: Response = .{ .status = .ok };
             resp.stream_fn = dummyStreamFn;
             return resp;
         }
         fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expect(resp.stream_fn != null);
     try testing.expect(resp.chunked);
 }
@@ -755,14 +751,14 @@ test "Connection: streaming sets Connection close" {
             "\r\n",
     );
     const handler = struct {
-        fn handle(_: *const Request, _: std.Io) Response {
+        fn handle(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             var resp: Response = .{ .status = .ok, .chunked = true };
             resp.stream_fn = dummyStreamFn;
             return resp;
         }
         fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
     }.handle;
-    const resp = processRequest(0, &req, handler, test_io);
+    const resp = processRequest(std.testing.allocator, test_io, 0, &req, handler);
     try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 

@@ -22,7 +22,7 @@ pub const Params = struct {
 };
 
 /// Route handler that receives path parameters.
-pub const RouteHandler = *const fn (*const Request, *const Params, std.Io) Response;
+pub const RouteHandler = *const fn (std.mem.Allocator, std.Io, *const Request, *const Params) Response;
 
 /// A single route definition.
 pub const Route = struct {
@@ -41,13 +41,13 @@ pub fn handler(comptime routes: []const Route) Connection.Handler {
 /// Build a Connection.Handler with a custom fallback for unmatched routes.
 pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: RouteHandler) Connection.Handler {
     return struct {
-        fn dispatch(request: *const Request, io: std.Io) Response {
+        fn dispatch(allocator: std.mem.Allocator, io: std.Io, request: *const Request) Response {
             const path = extractPath(request.uri);
 
             inline for (routes) |route| {
                 if (request.method == route.method) {
                     if (matchPath(route.path, path)) |params| {
-                        var response = route.handler(request, &params, io);
+                        var response = route.handler(allocator, io, request, &params);
                         if (route.ws) |ws| {
                             response.ws_handler = ws.handler;
                         }
@@ -57,12 +57,12 @@ pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: R
             }
 
             var params: Params = .{};
-            return not_found(request, &params, io);
+            return not_found(allocator, io, request, &params);
         }
     }.dispatch;
 }
 
-fn defaultNotFound(_: *const Request, _: *const Params, _: std.Io) Response {
+fn defaultNotFound(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
     return Response.init(.not_found, "text/plain", "Not Found");
 }
 
@@ -256,17 +256,17 @@ test "Router: Params.get" {
 test "Router: dispatch selects correct handler" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/", .handler = struct {
-            fn h(_: *const Request, _: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
                 return Response.init(.ok, "text/plain", "home");
             }
         }.h },
         .{ .method = .GET, .path = "/users/:id", .handler = struct {
-            fn h(_: *const Request, params: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, params: *const Params) Response {
                 return Response.init(.ok, "text/plain", params.get("id") orelse "none");
             }
         }.h },
         .{ .method = .POST, .path = "/users", .handler = struct {
-            fn h(_: *const Request, _: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
                 return Response.init(.created, "text/plain", "created");
             }
         }.h },
@@ -277,36 +277,36 @@ test "Router: dispatch selects correct handler" {
 
     // GET /
     const req1 = try Request.parseConst("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    const resp1 = dispatch(&req1, test_io);
+    const resp1 = dispatch(std.testing.allocator, test_io, &req1);
     try testing.expectEqualStrings("home", resp1.body);
 
     // GET /users/42
     const req2 = try Request.parseConst("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    const resp2 = dispatch(&req2, test_io);
+    const resp2 = dispatch(std.testing.allocator, test_io, &req2);
     try testing.expectEqualStrings("42", resp2.body);
 
     // POST /users
     const req3 = try Request.parseConst("POST /users HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-    const resp3 = dispatch(&req3, test_io);
+    const resp3 = dispatch(std.testing.allocator, test_io, &req3);
     try testing.expectEqual(Response.StatusCode.created, resp3.status);
 
     // GET /nonexistent → 404
     const req4 = try Request.parseConst("GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    const resp4 = dispatch(&req4, test_io);
+    const resp4 = dispatch(std.testing.allocator, test_io, &req4);
     try testing.expectEqual(Response.StatusCode.not_found, resp4.status);
 }
 
 test "Router: custom 404 fallback" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/", .handler = struct {
-            fn h(_: *const Request, _: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
                 return Response.init(.ok, "text/plain", "home");
             }
         }.h },
     };
 
     const custom_404 = struct {
-        fn h(_: *const Request, _: *const Params, _: std.Io) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
             return Response.init(.not_found, "text/html", "<h1>Custom 404</h1>");
         }
     }.h;
@@ -315,14 +315,14 @@ test "Router: custom 404 fallback" {
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
 
     const req = try Request.parseConst("GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    const resp = dispatch(&req, test_io);
+    const resp = dispatch(std.testing.allocator, test_io, &req);
     try testing.expectEqualStrings("<h1>Custom 404</h1>", resp.body);
 }
 
 test "Router: dispatch with query string" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/search", .handler = struct {
-            fn h(_: *const Request, _: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
                 return Response.init(.ok, "text/plain", "search");
             }
         }.h },
@@ -332,7 +332,7 @@ test "Router: dispatch with query string" {
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
 
     const req = try Request.parseConst("GET /search?q=test HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    const resp = dispatch(&req, test_io);
+    const resp = dispatch(std.testing.allocator, test_io, &req);
     try testing.expectEqualStrings("search", resp.body);
 }
 
@@ -343,7 +343,7 @@ test "Router: ws_handler is set on response" {
 
     const routes = [_]Route{
         .{ .method = .GET, .path = "/ws", .handler = struct {
-            fn h(request: *const Request, _: *const Params, _: std.Io) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request, _: *const Params) Response {
                 return WebSocket.upgradeResponse(request) orelse
                     Response.init(.bad_request, "text/plain", "upgrade failed");
             }
@@ -362,7 +362,7 @@ test "Router: ws_handler is set on response" {
             "Sec-WebSocket-Version: 13\r\n" ++
             "\r\n",
     );
-    const resp = dispatch(&req, test_io);
+    const resp = dispatch(std.testing.allocator, test_io, &req);
     try testing.expectEqual(Response.StatusCode.switching_protocols, resp.status);
     try testing.expect(resp.ws_handler != null);
 }
