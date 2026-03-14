@@ -61,10 +61,20 @@ fn handleListUsers(_: *const httpz.Request, _: *const httpz.Router.Params, _: st
 fn handleGetUser(_: *const httpz.Request, params: *const httpz.Router.Params, _: std.Io) httpz.Response {
     const id = params.get("id") orelse
         return httpz.Response.init(.bad_request, "text/plain", "Missing id");
-    _ = id;
-    return httpz.Response.init(.ok, "application/json",
-        \\{"id":42,"name":"Alice"}
-    );
+
+    const allocator = std.heap.page_allocator;
+    var buf: [128]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"name\":\"User {s}\"}}", .{ id, id }) catch
+        return httpz.Response.init(.internal_server_error, "text/plain", "Response too large");
+
+    // Heap-allocate so the body outlives this stack frame.
+    // The server calls response.deinit() after sending, which frees it.
+    const owned = allocator.dupe(u8, body) catch
+        return httpz.Response.init(.internal_server_error, "text/plain", "Out of memory");
+
+    var resp = httpz.Response.init(.ok, "application/json", owned);
+    resp._body_allocated = owned;
+    return resp;
 }
 
 fn handleCreateUser(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
