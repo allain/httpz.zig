@@ -1,6 +1,7 @@
 const Server = @This();
 const std = @import("std");
 const Io = std.Io;
+const tls = @import("tls");
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Connection = @import("Connection.zig");
@@ -64,6 +65,10 @@ pub const Config = struct {
     enable_proxy: bool = false,
     /// Proxy access control settings. Only used when enable_proxy is true.
     proxy: ProxyConfig = .{},
+    /// TLS configuration for HTTPS support.
+    /// When set, the server performs a TLS handshake on each accepted
+    /// connection and serves HTTP over the encrypted channel.
+    tls_config: ?tls.config.Server = null,
 };
 
 const min_initial_request_buffer_size = 16 * 1024;
@@ -137,6 +142,35 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     var net_reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
     var net_writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
 
+    // TLS handshake if configured
+    var tls_conn: ?tls.Connection = null;
+    var tls_read_buf: [8192]u8 = undefined;
+    var tls_write_buf: [8192]u8 = undefined;
+
+    if (self.config.tls_config) |tls_config| {
+        tls_conn = tls.server(&net_reader.interface, &net_writer.interface, tls_config) catch {
+            return;
+        };
+    }
+
+    // Get the appropriate reader/writer interfaces - either TLS or plain TCP
+    var tls_reader_wrapper: tls.Connection.Reader = undefined;
+    var tls_writer_wrapper: tls.Connection.Writer = undefined;
+
+    if (tls_conn) |*tc| {
+        tls_reader_wrapper = tc.reader(&tls_read_buf);
+        tls_writer_wrapper = tc.writer(&tls_write_buf);
+    }
+
+    const reader: *Io.Reader = if (tls_conn != null)
+        &tls_reader_wrapper.interface
+    else
+        &net_reader.interface;
+    const writer: *Io.Writer = if (tls_conn != null)
+        &tls_writer_wrapper.interface
+    else
+        &net_writer.interface;
+
     // Heap-allocate the request buffer to avoid ~1 MiB stack usage per
     // connection, which can cause stack overflows under concurrent load.
     var request_buf = std.heap.page_allocator.alloc(u8, initialRequestBufferSize(self.config)) catch return;
@@ -146,7 +180,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // Read request headers into a sub-slice limited by max_header_size
         // to prevent unterminated headers from consuming the full request buffer.
         const header_limit = @min(self.config.max_header_size, request_buf.len);
-        const header_len = readHeaders(&net_reader.interface, request_buf[0..header_limit]) catch |err| switch (err) {
+        const header_len = readHeaders(reader, request_buf[0..header_limit]) catch |err| switch (err) {
             error.EndOfStream => return, // Client closed connection
             error.ReadFailed => return, // Timeout or connection reset
         };
@@ -157,14 +191,14 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         const expect_value = extractHeaderValue(request_buf[0..header_len], "expect");
         if (expect_value) |ev| {
             if (Headers.eqlIgnoreCase(ev, "100-continue")) {
-                net_writer.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
-                net_writer.interface.flush() catch return;
+                writer.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
+                writer.flush() catch return;
             } else {
                 const resp: Response = .{ .status = .expectation_failed, .body = "Expectation Failed" };
                 var resp_buf: [Response.max_response_len]u8 = undefined;
                 const resp_data = resp.serialize(&resp_buf) catch return;
-                net_writer.interface.writeAll(resp_data) catch return;
-                net_writer.interface.flush() catch return;
+                writer.writeAll(resp_data) catch return;
+                writer.flush() catch return;
                 return;
             }
         }
@@ -181,20 +215,20 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             const resp: Response = .{ .status = .not_implemented, .body = "Unsupported Transfer-Encoding" };
             var resp_buf: [Response.max_response_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
-            net_writer.interface.writeAll(resp_data) catch return;
-            net_writer.interface.flush() catch return;
+            writer.writeAll(resp_data) catch return;
+            writer.flush() catch return;
             return;
         }
 
         if (te != null and Headers.eqlIgnoreCase(te.?, "chunked")) {
             // RFC 2616 Section 3.6.1: Read chunked body from stream.
-            total = readChunkedBody(&net_reader.interface, &request_buf, total, self.config.max_request_size) catch |err| switch (err) {
+            total = readChunkedBody(reader, &request_buf, total, self.config.max_request_size) catch |err| switch (err) {
                 error.EndOfStream => {
                     const resp: Response = .{ .status = .bad_request, .body = "Incomplete chunked body" };
                     var resp_buf: [Response.max_response_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
-                    net_writer.interface.writeAll(resp_data) catch return;
-                    net_writer.interface.flush() catch return;
+                    writer.writeAll(resp_data) catch return;
+                    writer.flush() catch return;
                     return;
                 },
                 error.ReadFailed => return error.ReadFailed,
@@ -202,16 +236,16 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                     const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
                     var resp_buf: [Response.max_response_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
-                    net_writer.interface.writeAll(resp_data) catch return;
-                    net_writer.interface.flush() catch return;
+                    writer.writeAll(resp_data) catch return;
+                    writer.flush() catch return;
                     return;
                 },
                 error.InvalidChunkedEncoding => {
                     const resp: Response = .{ .status = .bad_request, .body = "Invalid chunked body" };
                     var resp_buf: [Response.max_response_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
-                    net_writer.interface.writeAll(resp_data) catch return;
-                    net_writer.interface.flush() catch return;
+                    writer.writeAll(resp_data) catch return;
+                    writer.flush() catch return;
                     return;
                 },
             };
@@ -222,14 +256,14 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                     const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
                     var resp_buf: [Response.max_response_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
-                    net_writer.interface.writeAll(resp_data) catch return;
-                    net_writer.interface.flush() catch return;
+                    writer.writeAll(resp_data) catch return;
+                    writer.flush() catch return;
                     return;
                 }
                 ensureRequestCapacity(&request_buf, header_len + body_len, self.config.max_request_size) catch return;
                 const to_read = body_len;
                 if (to_read > 0) {
-                    net_reader.interface.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
+                    reader.readSliceAll(request_buf[total..][0..to_read]) catch |err| switch (err) {
                         error.EndOfStream => {},
                         error.ReadFailed => return error.ReadFailed,
                     };
@@ -258,8 +292,8 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             const resp: Response = .{ .status = status, .body = status.reason() };
             var resp_buf: [Response.max_response_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
-            net_writer.interface.writeAll(resp_data) catch return;
-            net_writer.interface.flush() catch return;
+            writer.writeAll(resp_data) catch return;
+            writer.flush() catch return;
             return;
         };
 
@@ -285,13 +319,13 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         const resp_data = response.serialize(&resp_buf) catch {
             const err_resp: Response = .{ .status = .internal_server_error, .body = "Internal Server Error" };
             const err_data = err_resp.serialize(&resp_buf) catch return;
-            net_writer.interface.writeAll(err_data) catch return;
-            net_writer.interface.flush() catch return;
+            writer.writeAll(err_data) catch return;
+            writer.flush() catch return;
             return;
         };
 
-        net_writer.interface.writeAll(resp_data) catch return;
-        net_writer.interface.flush() catch return;
+        writer.writeAll(resp_data) catch return;
+        writer.flush() catch return;
 
         // RFC 2616 Section 8.1: Check if connection should persist
         if (!Connection.shouldKeepAlive(&request)) {

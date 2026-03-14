@@ -4,3 +4,7 @@ zig-pkg/
 
 kcov-output/
 deps/
+
+# Generated local TLS certificates
+/cert/
+examples/cert/*.pem

@@ -4,7 +4,6 @@ const std = @import("std");
 /// RFC 2616 Section 4.2: HTTP headers are case-insensitive field names
 /// with associated values. Multiple headers with the same name are
 /// combined with comma separation.
-
 pub const Entry = struct {
     name: []const u8,
     value: []const u8,

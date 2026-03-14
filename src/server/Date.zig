@@ -9,7 +9,6 @@ const Io = std.Io;
 ///
 /// RFC 2616 Section 14.18: Origin servers MUST include a Date header
 /// in every response. The date MUST be in GMT.
-
 const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 

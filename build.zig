@@ -45,6 +45,36 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(client_exe);
 
+    // Example executables
+    const examples = [_][]const u8{
+        "client_http",
+        "client_https",
+        "server_http",
+        "server_https",
+    };
+
+    inline for (examples) |name| {
+        const example_mod = b.createModule(.{
+            .root_source_file = b.path("examples/" ++ name ++ ".zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        });
+        const example_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = example_mod,
+        });
+        b.installArtifact(example_exe);
+
+        const run_step = b.step("example_" ++ name, "Run the " ++ name ++ " example");
+        const run_cmd = b.addRunArtifact(example_exe);
+        run_step.dependOn(&run_cmd.step);
+        run_cmd.step.dependOn(b.getInstallStep());
+    }
+
     // Run step
     const run_step = b.step("run", "Run the HTTP server");
     const run_cmd = b.addRunArtifact(exe);
