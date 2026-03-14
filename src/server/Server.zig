@@ -89,10 +89,12 @@ pub fn init(config: Config, handler: Connection.Handler) Server {
 ///
 /// Uses Io.net.IpAddress.listen() to create a listening socket and
 /// Server.accept() to handle incoming connections.
-pub fn run(self: *Server, io: Io) !void {
-    const addr = try Io.net.IpAddress.parseIp4(self.config.address, self.config.port);
+pub const RunError = error{AddressInUse};
 
-    var server = try Io.net.IpAddress.listen(addr, io, .{});
+pub fn run(self: *Server, io: Io) RunError!void {
+    const addr = Io.net.IpAddress.parseIp4(self.config.address, self.config.port) catch return error.AddressInUse;
+
+    var server = Io.net.IpAddress.listen(addr, io, .{ .reuse_address = true }) catch return error.AddressInUse;
     defer server.deinit(io);
     var connection_group: Io.Group = .init;
     defer connection_group.cancel(io);
@@ -134,8 +136,10 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     // on blocking sockets as a programmer bug (panic). Idle connections
     // close naturally via EndOfStream when the client disconnects.
 
-    var read_buf: [8192]u8 = undefined;
-    var write_buf: [8192]u8 = undefined;
+    // TLS records can be up to ~16KB and must be read in full, so use
+    // TLS-sized buffers for the underlying TCP reader/writer.
+    var read_buf: [tls.input_buffer_len]u8 = undefined;
+    var write_buf: [tls.output_buffer_len]u8 = undefined;
     var net_reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
     var net_writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
 
@@ -367,6 +371,9 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         writer.writeAll(resp_data) catch return;
         writer.flush() catch return;
+        // TLS writer flush encrypts into the buffered TCP writer;
+        // flush the TCP layer so the response actually reaches the client.
+        if (tls_conn != null) net_writer.interface.flush() catch return;
 
         // RFC 2616 Section 8.1: Check if connection should persist
         if (!Connection.shouldKeepAlive(&request)) {

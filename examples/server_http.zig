@@ -13,9 +13,11 @@ pub fn main(init: std.process.Init) !void {
         .address = "127.0.0.1",
     }, handler);
 
-    server.run(io) catch |err| {
-        std.debug.print("Error: {}\n", .{err});
-        std.process.exit(1);
+    server.run(io) catch |err| switch (err) {
+        error.AddressInUse => {
+            std.debug.print("Error: port 8080 is already in use\n", .{});
+            std.process.exit(1);
+        },
     };
 }
 

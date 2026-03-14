@@ -38,9 +38,11 @@ pub fn main(init: std.process.Init) !void {
         },
     }, handler);
 
-    server.run(io) catch |err| {
-        std.debug.print("Error: {}\n", .{err});
-        std.process.exit(1);
+    server.run(io) catch |err| switch (err) {
+        error.AddressInUse => {
+            std.debug.print("Error: port 4433 is already in use\n", .{});
+            std.process.exit(1);
+        },
     };
 }
 
