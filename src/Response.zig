@@ -380,7 +380,13 @@ const SendFileContext = struct {
 /// Create a streaming response that serves a file from disk.
 /// Uses the writer's native sendFile support (may use zero-copy on Linux).
 /// The file is opened at call time, streamed when the server calls stream_fn.
-pub fn sendFile(path: []const u8, content_type: []const u8) Response {
+///
+/// WARNING: This follows symlinks. Callers must validate that the path
+/// is within an expected directory to prevent path traversal attacks.
+///
+/// `max_file_size`: maximum allowed file size in bytes. Pass 0 for unlimited.
+/// Returns 413 Request Entity Too Large if the file exceeds the limit.
+pub fn sendFile(path: []const u8, content_type: []const u8, max_file_size: usize) Response {
     const file = std.fs.openFileAbsolute(path, .{}) catch {
         return Response.init(.not_found, "text/plain", "Not Found");
     };
@@ -389,6 +395,11 @@ pub fn sendFile(path: []const u8, content_type: []const u8) Response {
         file.close();
         return Response.init(.internal_server_error, "text/plain", "Internal Server Error");
     };
+
+    if (max_file_size > 0 and stat.size > max_file_size) {
+        file.close();
+        return Response.init(.request_entity_too_large, "text/plain", "Request Entity Too Large");
+    }
 
     const ctx = std.heap.page_allocator.create(SendFileContext) catch {
         file.close();

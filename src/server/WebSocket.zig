@@ -47,6 +47,9 @@ pub const Message = struct {
     payload: []const u8,
 };
 
+/// Maximum allowed frame payload size (16 MB).
+pub const max_frame_size: usize = 16 * 1024 * 1024;
+
 /// WebSocket connection wrapper for reading and writing frames.
 pub const Conn = struct {
     reader: *Io.Reader,
@@ -109,14 +112,15 @@ pub const Conn = struct {
                     if (!first_frame) return error.ProtocolError;
                     msg_opcode = frame.opcode;
                     if (frame.fin) {
-                        // Single-frame message — return payload directly from buf
+                        // Single-frame message — payload is already in self.buf
+                        // via readFrame, just copy to start if needed
                         if (frame.payload.len > self.buf.len) return error.MessageTooBig;
-                        @memcpy(self.buf[0..frame.payload.len], frame.payload);
+                        std.mem.copyForwards(u8, self.buf[0..frame.payload.len], frame.payload);
                         return .{ .opcode = frame.opcode, .payload = self.buf[0..frame.payload.len] };
                     }
                     // Start of fragmented message
                     if (frame.payload.len > self.buf.len) return error.MessageTooBig;
-                    @memcpy(self.buf[0..frame.payload.len], frame.payload);
+                    std.mem.copyForwards(u8, self.buf[0..frame.payload.len], frame.payload);
                     msg_start = frame.payload.len;
                     first_frame = false;
                 },
@@ -160,6 +164,8 @@ pub const Conn = struct {
         const fin = (header[0] & 0x80) != 0;
         const opcode: Opcode = @enumFromInt(@as(u4, @truncate(header[0] & 0x0f)));
         const masked = (header[1] & 0x80) != 0;
+        // RFC 6455 Section 5.1: client frames MUST be masked
+        if (!masked) return error.ProtocolError;
         var payload_len: u64 = header[1] & 0x7f;
 
         // Extended payload length
@@ -173,14 +179,13 @@ pub const Conn = struct {
             payload_len = std.mem.readInt(u64, &ext, .big);
         }
 
+        if (payload_len > max_frame_size) return error.MessageTooBig;
         if (payload_len > self.buf.len) return error.MessageTooBig;
         const len: usize = @intCast(payload_len);
 
-        // Read masking key
+        // Read masking key (always present — unmasked frames rejected above)
         var mask_key: [4]u8 = undefined;
-        if (masked) {
-            self.reader.readSliceAll(&mask_key) catch return error.ConnectionClosed;
-        }
+        self.reader.readSliceAll(&mask_key) catch return error.ConnectionClosed;
 
         // Read payload
         const payload = self.buf[0..len];
@@ -189,10 +194,8 @@ pub const Conn = struct {
         }
 
         // Unmask payload (RFC 6455 Section 5.3)
-        if (masked) {
-            for (payload, 0..) |*byte, i| {
-                byte.* ^= mask_key[i % 4];
-            }
+        for (payload, 0..) |*byte, i| {
+            byte.* ^= mask_key[i % 4];
         }
 
         return .{ .fin = fin, .opcode = opcode, .payload = payload };

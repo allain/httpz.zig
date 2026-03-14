@@ -15,36 +15,6 @@ pub fn build(b: *std.Build) void {
     });
     httpz_mod.addImport("tls", tls_mod);
 
-    // Executable
-    const exe = b.addExecutable(.{
-        .name = "httpz",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "httpz", .module = httpz_mod },
-            },
-        }),
-    });
-
-    b.installArtifact(exe);
-
-    // Client executable for testing
-    const client_exe = b.addExecutable(.{
-        .name = "httpz-client",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/client/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "httpz", .module = httpz_mod },
-                .{ .name = "tls", .module = tls_mod },
-            },
-        }),
-    });
-    b.installArtifact(client_exe);
-
     // Example executables
     const examples = [_][]const u8{
         "client_http",
@@ -78,15 +48,6 @@ pub fn build(b: *std.Build) void {
         run_cmd.step.dependOn(b.getInstallStep());
     }
 
-    // Run step
-    const run_step = b.step("run", "Run the HTTP server");
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
     // Module tests
     const mod_tests = b.addTest(.{
         .root_module = httpz_mod,
@@ -94,17 +55,28 @@ pub fn build(b: *std.Build) void {
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Exe tests
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+    // Integration tests
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "httpz", .module = httpz_mod },
+            },
+        }),
     });
 
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    // Integration test step (separate because they use networking)
+    const integration_step = b.step("test-integration", "Run integration tests");
+    integration_step.dependOn(&run_integration_tests.step);
 
     // Test step
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 
     // Coverage step using kcov
     const coverage_step = b.step("coverage", "Run tests with kcov code coverage");
@@ -122,22 +94,4 @@ pub fn build(b: *std.Build) void {
     kcov_mod.addArtifactArg(cov_mod_test);
     coverage_step.dependOn(&kcov_mod.step);
 
-    // Exe tests for main.zig handler coverage
-    const cov_exe_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .imports = &.{
-                .{ .name = "httpz", .module = httpz_mod },
-            },
-        }),
-        .use_llvm = true,
-        .use_lld = true,
-    });
-
-    const kcov_exe = b.addSystemCommand(&.{"kcov"});
-    kcov_exe.addPrefixedDirectoryArg("--include-path=", b.path("src"));
-    kcov_exe.addArg("kcov-output");
-    kcov_exe.addArtifactArg(cov_exe_test);
-    coverage_step.dependOn(&kcov_exe.step);
 }

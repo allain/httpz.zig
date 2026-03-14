@@ -57,6 +57,7 @@ pub fn init(comptime config: Config) type {
             resp.headers.append("Access-Control-Allow-Origin", config.origin) catch {};
             resp.headers.append("Access-Control-Allow-Methods", config.methods) catch {};
             resp.headers.append("Access-Control-Allow-Headers", config.headers) catch {};
+            resp.headers.append("Vary", "Origin") catch {};
         }
     };
 }

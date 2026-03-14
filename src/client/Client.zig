@@ -18,6 +18,9 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
     connection_timeout_s: u32 = 30,
     read_timeout_s: u32 = 60,
+    /// Maximum response body size in bytes (default 10 MB). Responses with
+    /// Content-Length exceeding this are rejected with error.ResponseTooLarge.
+    max_response_size: usize = 10 * 1024 * 1024,
     /// TLS configuration - if provided, HTTPS will be used
     tls_config: ?tls.config.Client = null,
 };
@@ -318,6 +321,8 @@ fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response
         const content_length = std.fmt.parseInt(usize, cl_str, 10) catch
             return error.InvalidResponse;
 
+        if (content_length > self.config.max_response_size) return error.ResponseTooLarge;
+
         const body_start = header_end + 4;
         if (body_start + content_length <= data.len) {
             const body = self.allocator.alloc(u8, content_length) catch
@@ -445,6 +450,8 @@ fn readResponse(self: *Client, reader: *Io.Reader) ResponseParseError!Response {
     if (cl) |cl_str| {
         const content_length = std.fmt.parseInt(usize, cl_str, 10) catch
             return error.InvalidResponse;
+
+        if (content_length > self.config.max_response_size) return error.ResponseTooLarge;
 
         if (content_length > 0) {
             const body_buf = self.allocator.alloc(u8, content_length) catch

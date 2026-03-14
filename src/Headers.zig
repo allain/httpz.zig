@@ -35,6 +35,7 @@ pub fn append(self: *Headers, name: []const u8, value: []const u8) Error!void {
     if (name.len == 0 or name.len > max_name_len) return error.InvalidHeaderName;
     if (!isValidToken(name)) return error.InvalidHeaderName;
     if (value.len > max_value_len) return error.InvalidHeaderValue;
+    if (containsCrlf(value)) return error.InvalidHeaderValue;
 
     self.entries[self.len] = .{ .name = name, .value = value };
     self.len += 1;
@@ -116,6 +117,15 @@ fn isTokenChar(c: u8) bool {
         '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', ' ', '\t' => false,
         else => c <= 126,
     };
+}
+
+/// Check if a string contains CR or LF characters.
+/// RFC 7230 Section 3.2.6: Field values must not contain bare CR or LF.
+fn containsCrlf(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '\r' or c == '\n') return true;
+    }
+    return false;
 }
 
 /// Case-insensitive comparison for ASCII strings.
@@ -232,6 +242,16 @@ test "Headers: eqlIgnoreCase" {
     try testing.expect(eqlIgnoreCase("Content-Type", "content-type"));
     try testing.expect(!eqlIgnoreCase("abc", "abcd"));
     try testing.expect(!eqlIgnoreCase("abc", "abd"));
+}
+
+// RFC 7230 Section 3.2.6: CRLF in header values causes response splitting
+test "Headers: CRLF in header value rejected" {
+    var h: Headers = .{};
+    try testing.expectError(error.InvalidHeaderValue, h.append("X-Header", "foo\r\nSet-Cookie: stolen=1"));
+    try testing.expectError(error.InvalidHeaderValue, h.append("X-Header", "foo\rbar"));
+    try testing.expectError(error.InvalidHeaderValue, h.append("X-Header", "foo\nbar"));
+    // Valid values should still work
+    try h.append("X-Header", "normal value");
 }
 
 // Server headers use reserved slots
