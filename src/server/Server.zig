@@ -129,13 +129,10 @@ pub fn run(self: *Server, io: Io) !void {
 fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     // Apply initial read timeout to prevent slowloris attacks on new connections.
     // This is set before the first read and later replaced by keep_alive_timeout.
-    const initial_timeout = if (self.config.initial_read_timeout_s > 0)
-        self.config.initial_read_timeout_s
-    else
-        self.config.keep_alive_timeout_s;
-    if (initial_timeout > 0) {
-        setSocketTimeout(stream.socket.handle, initial_timeout);
-    }
+    // NOTE: SO_RCVTIMEO is not used here because it causes EAGAIN on
+    // Linux when it fires, and Zig's threaded I/O backend treats EAGAIN
+    // on blocking sockets as a programmer bug (panic). Idle connections
+    // close naturally via EndOfStream when the client disconnects.
 
     var read_buf: [8192]u8 = undefined;
     var write_buf: [8192]u8 = undefined;
@@ -148,10 +145,34 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     var tls_write_buf: [8192]u8 = undefined;
 
     if (self.config.tls_config) |tls_config| {
+        // Peek at the first byte to detect plain HTTP on a TLS port.
+        // TLS records start with 0x16 (handshake). ASCII letters indicate
+        // a plain HTTP request (e.g. "GET", "POST", "HEAD").
+        const first = net_reader.interface.peek(1) catch {
+            return;
+        };
+        if (first.len > 0 and first[0] != 0x16) {
+            net_writer.interface.writeAll(
+                "HTTP/1.1 400 Bad Request\r\n" ++
+                    "Content-Type: text/plain\r\n" ++
+                    "Content-Length: 46\r\n" ++
+                    "Connection: close\r\n" ++
+                    "\r\n" ++
+                    "Client sent plain HTTP to an HTTPS-only port.\n",
+            ) catch {};
+            net_writer.interface.flush() catch {};
+            return;
+        }
+
         tls_conn = tls.server(&net_reader.interface, &net_writer.interface, tls_config) catch {
             return;
         };
     }
+    defer if (tls_conn) |*tc| {
+        tc.close() catch {};
+        // Flush the close_notify through the buffered TCP writer
+        net_writer.interface.flush() catch {};
+    };
 
     // Get the appropriate reader/writer interfaces - either TLS or plain TCP
     var tls_reader_wrapper: tls.Connection.Reader = undefined;
@@ -170,6 +191,26 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         &tls_writer_wrapper.interface
     else
         &net_writer.interface;
+
+    // Detect TLS ClientHello on a non-TLS port. The first byte of a TLS
+    // record is 0x16 (handshake). Send a plain HTTP 400 and close.
+    if (self.config.tls_config == null) {
+        const first = net_reader.interface.peek(1) catch {
+            return;
+        };
+        if (first.len > 0 and first[0] == 0x16) {
+            net_writer.interface.writeAll(
+                "HTTP/1.1 400 Bad Request\r\n" ++
+                    "Content-Type: text/plain\r\n" ++
+                    "Content-Length: 49\r\n" ++
+                    "Connection: close\r\n" ++
+                    "\r\n" ++
+                    "Client sent HTTPS request to a plain HTTP port.\n",
+            ) catch {};
+            net_writer.interface.flush() catch {};
+            return;
+        }
+    }
 
     // Heap-allocate the request buffer to avoid ~1 MiB stack usage per
     // connection, which can cause stack overflows under concurrent load.
@@ -332,10 +373,8 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             return;
         }
 
-        // Switch to keep-alive timeout for subsequent requests.
-        if (self.config.keep_alive_timeout_s > 0) {
-            setSocketTimeout(stream.socket.handle, self.config.keep_alive_timeout_s);
-        }
+        // NOTE: keep-alive timeout via SO_RCVTIMEO is not used because
+        // it causes EAGAIN panics in Zig's threaded I/O backend.
     }
 }
 

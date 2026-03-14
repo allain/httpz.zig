@@ -13,7 +13,10 @@ pub fn main(init: std.process.Init) !void {
         .address = "127.0.0.1",
     }, handler);
 
-    try server.run(io);
+    server.run(io) catch |err| {
+        std.debug.print("Error: {}\n", .{err});
+        std.process.exit(1);
+    };
 }
 
 fn handler(request: *const httpz.Request, _: std.Io) httpz.Response {
