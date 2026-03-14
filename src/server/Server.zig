@@ -391,8 +391,10 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         response.deinit(std.heap.page_allocator);
 
         // RFC 6455: WebSocket upgrade — hand off to WebSocket handler
+        // Per-route ws_handler (from Router) takes precedence over global config.
         if (response.status == .switching_protocols) {
-            if (self.config.websocket_handler) |ws_handler| {
+            const ws = response.ws_handler orelse self.config.websocket_handler;
+            if (ws) |ws_handler| {
                 var ws_buf: [65536]u8 = undefined;
                 var ws_conn = WebSocket.Conn.init(reader, writer, &ws_buf);
                 ws_handler(&ws_conn, &request);

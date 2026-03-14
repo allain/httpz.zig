@@ -124,6 +124,9 @@ strip_body: bool = false,
 /// RFC 2616 Section 3.6.1: When true, send body using chunked transfer encoding
 /// instead of Content-Length.
 chunked: bool = false,
+/// Per-route WebSocket handler, set by Router dispatch. When present,
+/// the server uses this instead of the global websocket_handler config.
+ws_handler: ?@import("server/WebSocket.zig").Handler = null,
 
 /// Embedded buffer for server-generated header values (Date, Via).
 /// Avoids threadlocal storage so header value slices have a well-defined
