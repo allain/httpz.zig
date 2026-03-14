@@ -4,10 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // TLS module
-    const tls_mod = b.addModule("tls", .{
-        .root_source_file = b.path("deps/tls/src/root.zig"),
-    });
+    // TLS module from dependency
+    const tls_pkg = b.dependency("tls", .{});
+    const tls_mod = tls_pkg.module("tls");
 
     // Library module
     const httpz_mod = b.addModule("httpz", .{

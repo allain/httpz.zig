@@ -64,6 +64,16 @@ const ClientError = error{
     ResponseTooLarge,
     InvalidResponse,
     ReadTimeout,
+    WriteFailed,
+    TlsCertificateExpired,
+    TlsCertificateRevoked,
+    TlsCertificateUnknown,
+    TlsUnsupportedCertificate,
+    TlsCertificateRequired,
+    TlsHandshakeFailure,
+    TlsAlert,
+    TlsUnexpectedMessage,
+    TlsCipherNoSpaceLeft,
 };
 
 pub const ResponseParseError = ClientError || error{
@@ -78,6 +88,10 @@ pub const ResponseParseError = ClientError || error{
 config: Config,
 stream: ?Io.net.Stream = null,
 tls_conn: ?tls.Connection = null,
+tls_reader: ?Io.net.Stream.Reader = null,
+tls_writer: ?Io.net.Stream.Writer = null,
+tls_input_buf: [tls.input_buffer_len]u8 = undefined,
+tls_output_buf: [tls.output_buffer_len]u8 = undefined,
 read_buf: []u8,
 write_buf: []u8,
 allocator: std.mem.Allocator,
@@ -88,6 +102,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const write_buf = allocator.alloc(u8, buf_size) catch unreachable;
     return .{
         .config = config,
+        .tls_input_buf = undefined,
+        .tls_output_buf = undefined,
         .read_buf = read_buf,
         .write_buf = write_buf,
         .allocator = allocator,
@@ -114,7 +130,9 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
     }
 
     if (self.config.tls_config) |tls_config| {
-        self.tls_conn = tls.clientFromStream(io, stream, tls_config) catch {
+        self.tls_reader = stream.reader(io, &self.tls_input_buf);
+        self.tls_writer = stream.writer(io, &self.tls_output_buf);
+        self.tls_conn = tls.client(&self.tls_reader.?.interface, &self.tls_writer.?.interface, tls_config) catch {
             return error.ConnectionFailed;
         };
     } else {
@@ -148,13 +166,41 @@ pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, h
 fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
     try self.sendRequestTls(conn, method, uri, headers, body);
 
-    const data = conn.next() catch return error.InvalidResponse;
+    const data = conn.next() catch |err| return mapTlsError(err);
     const response_data = data orelse return error.InvalidResponse;
 
     return try self.parseTlsResponse(response_data);
 }
 
-fn sendRequestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) anyerror!void {
+fn mapTlsError(err: anyerror) ResponseParseError {
+    return switch (err) {
+        error.WriteFailed => error.SendFailed,
+        error.ReadFailed => error.InvalidResponse,
+        error.TlsUnexpectedMessage => error.InvalidResponse,
+        error.TlsCipherNoSpaceLeft => error.SendFailed,
+        error.TlsAlertUnexpectedMessage,
+        error.TlsAlertBadRecordMac,
+        error.TlsAlertRecordOverflow,
+        error.TlsAlertHandshakeFailure,
+        error.TlsAlertDecodeError,
+        error.TlsAlertDecryptError,
+        error.TlsAlertInternalError,
+        => error.TlsHandshakeFailure,
+        error.TlsAlertBadCertificate,
+        error.TlsAlertUnsupportedCertificate,
+        error.TlsAlertCertificateUnknown,
+        => error.TlsUnsupportedCertificate,
+        error.TlsAlertCertificateRevoked => error.TlsCertificateRevoked,
+        error.TlsAlertCertificateExpired => error.TlsCertificateExpired,
+        error.TlsAlertCertificateRequired => error.TlsCertificateRequired,
+        error.TlsAlertUnknownCa,
+        error.TlsAlertAccessDenied,
+        => error.TlsHandshakeFailure,
+        else => error.InvalidResponse,
+    };
+}
+
+fn sendRequestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!void {
     var buf: [8192]u8 = undefined;
     var pos: usize = 0;
 

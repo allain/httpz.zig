@@ -307,11 +307,11 @@ pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Resp
 }
 
 /// Free any allocated body memory.
-pub fn deinit(resp: *Response, allocator: std.mem.Allocator) void {
-    if (resp._body_allocated) |allocated| {
+pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
+    if (self._body_allocated) |allocated| {
         allocator.free(allocated);
-        resp.body = "";
-        resp._body_allocated = null;
+        self.body = "";
+        self._body_allocated = null;
     }
 }
 

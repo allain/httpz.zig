@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const httpz = @import("httpz");
 const Client = httpz.Client;
+const Response = httpz.Response;
 const tls = @import("tls");
 
 pub fn main(init: std.process.Init) !void {
@@ -47,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("Connected! Sending request...\n", .{});
     try stdout.flush();
 
-    const resp = try client.request(io, .GET, url.path, null, null);
+    var resp = try client.request(io, .GET, url.path, null, null);
 
     try stdout.print("Status: {}\n", .{resp.status});
     try stdout.print("Content-Type: {s}\n", .{resp.headers.get("Content-Type") orelse "unknown"});
@@ -59,5 +60,6 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
     }
 
+    resp.deinit(allocator);
     client.deinit();
 }
