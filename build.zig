@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         "server_https",
         "server_websocket",
         "server_router",
+        "server_streaming",
     };
 
     inline for (examples) |name| {

@@ -373,6 +373,31 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
 
         // Serialize and send response
         var resp_buf: [Response.max_response_len]u8 = undefined;
+
+        if (response.stream_fn) |stream_fn| {
+            // Streaming response path: send headers, then call stream_fn
+            const header_data = response.serializeHeaders(&resp_buf) catch {
+                const err_resp: Response = .{ .status = .internal_server_error, .body = "Internal Server Error" };
+                const err_data = err_resp.serialize(&resp_buf) catch return;
+                writer.writeAll(err_data) catch return;
+                writer.flush() catch return;
+                return;
+            };
+            writer.writeAll(header_data) catch return;
+            writer.flush() catch return;
+            if (tls_conn != null) net_writer.interface.flush() catch return;
+
+            // Call stream function with the network writer
+            stream_fn(response.stream_context, writer);
+
+            // Final flush
+            writer.flush() catch return;
+            if (tls_conn != null) net_writer.interface.flush() catch return;
+            response.deinit(std.heap.page_allocator);
+            // Streaming responses don't keep-alive (simplicity)
+            return;
+        }
+
         const resp_data = response.serialize(&resp_buf) catch {
             const err_resp: Response = .{ .status = .internal_server_error, .body = "Internal Server Error" };
             const err_data = err_resp.serialize(&resp_buf) catch return;

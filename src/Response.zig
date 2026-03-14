@@ -127,6 +127,15 @@ chunked: bool = false,
 /// Per-route WebSocket handler, set by Router dispatch. When present,
 /// the server uses this instead of the global websocket_handler config.
 ws_handler: ?@import("server/WebSocket.zig").Handler = null,
+/// Optional streaming callback. When set, the server serializes headers only,
+/// then calls this function with the network writer for streaming the body.
+/// The function writes directly to the wire. Void return matches the WebSocket
+/// handler precedent — errors mean "connection lost" and the server closes
+/// the connection regardless.
+stream_fn: ?*const fn (?*anyopaque, *std.Io.Writer) void = null,
+/// Optional opaque context pointer passed to stream_fn. Zig has no closures,
+/// so this lets handlers pass state (file handles, etc.) to their stream function.
+stream_context: ?*anyopaque = null,
 
 /// Embedded buffer for server-generated header values (Date, Via).
 /// Avoids threadlocal storage so header value slices have a well-defined
@@ -153,17 +162,10 @@ pub const SerializeError = error{
     ResponseTooLarge,
 };
 
-/// Serialize the response into a buffer.
-///
-/// RFC 2616 Section 6: The response format is:
-///   Status-Line CRLF
-///   *(header-field CRLF)
-///   CRLF
-///   [message-body]
-///
-/// RFC 2616 Section 6.1:
-///   Status-Line = HTTP-Version SP Status-Code SP Reason-Phrase CRLF
-pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
+/// Serialize only the response headers (status line + headers + terminating CRLF).
+/// Used by the streaming path — body is written separately via stream_fn.
+/// Also used internally by serialize().
+pub fn serializeHeaders(self: *const Response, buf: []u8) SerializeError![]const u8 {
     var pos: usize = 0;
 
     // Status-Line
@@ -199,6 +201,23 @@ pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
 
     // End of headers
     pos = appendSlice(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+
+    return buf[0..pos];
+}
+
+/// Serialize the response into a buffer.
+///
+/// RFC 2616 Section 6: The response format is:
+///   Status-Line CRLF
+///   *(header-field CRLF)
+///   CRLF
+///   [message-body]
+///
+/// RFC 2616 Section 6.1:
+///   Status-Line = HTTP-Version SP Status-Code SP Reason-Phrase CRLF
+pub fn serialize(self: *const Response, buf: []u8) SerializeError![]const u8 {
+    const header_data = try self.serializeHeaders(buf);
+    var pos: usize = header_data.len;
 
     // RFC 2616 Section 9.4: HEAD responses MUST NOT include a body
     if (!self.strip_body) {
@@ -341,6 +360,57 @@ pub fn gzip(self: *Response) void {
     self._body_allocated = compressed;
     self.headers.append("Content-Encoding", "gzip") catch {};
     self.headers.append("Vary", "Accept-Encoding") catch {};
+}
+
+/// Context for the sendFile stream function.
+const SendFileContext = struct {
+    file: std.fs.File,
+
+    fn streamFn(ctx_ptr: ?*anyopaque, writer: *std.Io.Writer) void {
+        const self: *SendFileContext = @ptrCast(@alignCast(ctx_ptr));
+        defer {
+            self.file.close();
+            std.heap.page_allocator.destroy(self);
+        }
+        const file_reader = self.file.reader();
+        writer.sendFileAll(&file_reader, .unlimited) catch return;
+    }
+};
+
+/// Create a streaming response that serves a file from disk.
+/// Uses the writer's native sendFile support (may use zero-copy on Linux).
+/// The file is opened at call time, streamed when the server calls stream_fn.
+pub fn sendFile(path: []const u8, content_type: []const u8) Response {
+    const file = std.fs.openFileAbsolute(path, .{}) catch {
+        return Response.init(.not_found, "text/plain", "Not Found");
+    };
+
+    const stat = file.stat() catch {
+        file.close();
+        return Response.init(.internal_server_error, "text/plain", "Internal Server Error");
+    };
+
+    const ctx = std.heap.page_allocator.create(SendFileContext) catch {
+        file.close();
+        return Response.init(.internal_server_error, "text/plain", "Internal Server Error");
+    };
+    ctx.* = .{ .file = file };
+
+    var resp: Response = .{ .status = .ok };
+    resp.headers.append("Content-Type", content_type) catch {};
+
+    // Set Content-Length from file size — no chunked encoding needed
+    var cl_buf_storage: [20]u8 = undefined;
+    const cl_str = formatUsize(stat.size, &cl_buf_storage);
+    if (resp.allocServerBuf(cl_str.len)) |buf| {
+        @memcpy(buf, cl_str);
+        resp.headers.append("Content-Length", buf) catch {};
+    }
+    resp.auto_content_length = false;
+
+    resp.stream_fn = SendFileContext.streamFn;
+    resp.stream_context = @ptrCast(ctx);
+    return resp;
 }
 
 const ByteRange = @import("Request.zig").ByteRange;
@@ -817,4 +887,45 @@ test "Response: gzip no-op on empty body" {
     resp.gzip();
     try testing.expectEqualStrings("", resp.body);
     try testing.expect(resp.headers.get("Content-Encoding") == null);
+}
+
+// serializeHeaders returns only status line + headers + CRLF
+test "Response: serializeHeaders" {
+    var resp: Response = .{
+        .status = .ok,
+        .body = "Hello",
+    };
+    try resp.headers.append("Content-Type", "text/plain");
+
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serializeHeaders(&buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n",
+        result,
+    );
+    // Body should NOT be included
+    try testing.expect(std.mem.indexOf(u8, result, "Hello") == null);
+}
+
+// Streaming fields default to null
+test "Response: streaming fields default to null" {
+    const resp: Response = .{};
+    try testing.expect(resp.stream_fn == null);
+    try testing.expect(resp.stream_context == null);
+}
+
+// serializeHeaders with chunked transfer encoding
+test "Response: serializeHeaders with chunked" {
+    const resp: Response = .{
+        .status = .ok,
+        .chunked = true,
+    };
+    var buf: [1024]u8 = undefined;
+    const result = try resp.serializeHeaders(&buf);
+    try testing.expect(std.mem.indexOf(u8, result, "Transfer-Encoding: chunked\r\n") != null);
+    // Should end with \r\n (no body/chunk data)
+    try testing.expect(std.mem.endsWith(u8, result, "\r\n\r\n"));
 }

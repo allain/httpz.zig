@@ -4,6 +4,7 @@ const Response = @import("../Response.zig");
 const Router = @import("../Router.zig");
 const Connection = @import("../server/Connection.zig");
 const Compression = @import("../server/Compression.zig");
+const flate = std.compress.flate;
 
 /// Wrap a route handler to automatically gzip-compress responses
 /// when the client accepts gzip and the content type is compressible.
@@ -13,7 +14,13 @@ pub fn wrap(comptime inner: Router.RouteHandler) Router.RouteHandler {
             var resp = inner(req, params, io);
             if (req.acceptsEncoding("gzip")) {
                 const ct = resp.headers.get("Content-Type") orelse "";
-                if (Compression.isCompressible(ct)) resp.gzip();
+                if (Compression.isCompressible(ct)) {
+                    if (resp.stream_fn != null) {
+                        wrapStreamingGzip(&resp);
+                    } else {
+                        resp.gzip();
+                    }
+                }
             }
             return resp;
         }
@@ -27,11 +34,56 @@ pub fn wrapAll(comptime inner: Connection.Handler) Connection.Handler {
             var resp = inner(req, io);
             if (req.acceptsEncoding("gzip")) {
                 const ct = resp.headers.get("Content-Type") orelse "";
-                if (Compression.isCompressible(ct)) resp.gzip();
+                if (Compression.isCompressible(ct)) {
+                    if (resp.stream_fn != null) {
+                        wrapStreamingGzip(&resp);
+                    } else {
+                        resp.gzip();
+                    }
+                }
             }
             return resp;
         }
     }.handle;
+}
+
+/// Context for wrapping a streaming response with gzip compression.
+const GzipStreamContext = struct {
+    original_fn: *const fn (?*anyopaque, *std.Io.Writer) void,
+    original_ctx: ?*anyopaque,
+
+    fn streamFn(ctx_ptr: ?*anyopaque, writer: *std.Io.Writer) void {
+        const self: *GzipStreamContext = @ptrCast(@alignCast(ctx_ptr));
+        defer std.heap.page_allocator.destroy(self);
+
+        // Allocate window buffer for the compressor
+        const window_buf = std.heap.page_allocator.alloc(u8, flate.max_window_len) catch return;
+        defer std.heap.page_allocator.free(window_buf);
+
+        var comp = flate.Compress.init(writer, window_buf, .gzip, .default) catch return;
+
+        // Call the original stream function with the compressor's writer
+        self.original_fn(self.original_ctx, &comp.writer);
+
+        // Finalize the gzip stream
+        comp.finish() catch return;
+    }
+};
+
+/// Replace a streaming response's stream_fn with a gzip-wrapping version.
+fn wrapStreamingGzip(resp: *Response) void {
+    const ctx = std.heap.page_allocator.create(GzipStreamContext) catch return;
+    ctx.* = .{
+        .original_fn = resp.stream_fn.?,
+        .original_ctx = resp.stream_context,
+    };
+    resp.stream_fn = GzipStreamContext.streamFn;
+    resp.stream_context = @ptrCast(ctx);
+    resp.headers.append("Content-Encoding", "gzip") catch {};
+    resp.headers.append("Vary", "Accept-Encoding") catch {};
+    // Remove Content-Length since compressed size is unknown
+    resp.headers.remove("Content-Length");
+    resp.auto_content_length = false;
 }
 
 // --- Tests ---

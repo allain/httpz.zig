@@ -107,9 +107,19 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
         response.headers.appendServer("Connection", "close");
     }
 
+    // Streaming responses: force Connection: close (no keep-alive) for simplicity
+    if (response.stream_fn != null) {
+        if (response.headers.get("Connection") == null) {
+            response.headers.appendServer("Connection", "close");
+        }
+    }
+
     // RFC 2616 Section 9.4: HEAD must return same headers as GET but no body.
     if (request.method == .HEAD) {
         response.strip_body = true;
+        // HEAD responses must not send a body, so disable streaming
+        response.stream_fn = null;
+        response.stream_context = null;
     }
 
     // RFC 2616 Section 3.1: Respond with HTTP/1.0 to HTTP/1.0 clients.
@@ -120,6 +130,20 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
             response.chunked = false;
             response.auto_content_length = true;
         }
+        // HTTP/1.0 doesn't support chunked — streaming uses raw connection close
+        if (response.stream_fn != null and response.chunked) {
+            response.chunked = false;
+        }
+    }
+
+    // Streaming safety net: if streaming with no Content-Length and not chunked,
+    // force chunked encoding to prevent HTTP clients from hanging
+    if (response.stream_fn != null and
+        response.headers.get("Content-Length") == null and
+        !response.chunked and
+        request.version != .http_1_0)
+    {
+        response.chunked = true;
     }
 
     // RFC 2616 Section 4.3: Responses to body-forbidden status codes
@@ -128,6 +152,8 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
         response.auto_content_length = false;
         response.strip_body = true;
         response.body = "";
+        response.stream_fn = null;
+        response.stream_context = null;
     }
 
     return response;
@@ -660,6 +686,84 @@ test "Connection: TRACE works when enabled" {
     const resp = processRequestWithOptions(0, &req, testHandler, test_io, .{ .enable_trace = true });
     try testing.expectEqual(Response.StatusCode.ok, resp.status);
     try testing.expectEqualStrings("message/http", resp.headers.get("Content-Type").?);
+}
+
+// Streaming: HEAD request nulls out stream_fn
+test "Connection: HEAD nulls stream_fn" {
+    const req = try Request.parseConst(
+        "HEAD / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            var resp: Response = .{ .status = .ok, .chunked = true };
+            resp.stream_fn = dummyStreamFn;
+            return resp;
+        }
+        fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.stream_fn == null);
+    try testing.expect(resp.strip_body);
+}
+
+// Streaming: body-forbidden status nulls out stream_fn
+test "Connection: 204 nulls stream_fn" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            var resp: Response = .{ .status = .no_content };
+            resp.stream_fn = dummyStreamFn;
+            return resp;
+        }
+        fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.stream_fn == null);
+}
+
+// Streaming: auto-chunked when no Content-Length for HTTP/1.1
+test "Connection: streaming auto-chunked" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            var resp: Response = .{ .status = .ok };
+            resp.stream_fn = dummyStreamFn;
+            return resp;
+        }
+        fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expect(resp.stream_fn != null);
+    try testing.expect(resp.chunked);
+}
+
+// Streaming: Connection: close is set
+test "Connection: streaming sets Connection close" {
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n",
+    );
+    const handler = struct {
+        fn handle(_: *const Request, _: std.Io) Response {
+            var resp: Response = .{ .status = .ok, .chunked = true };
+            resp.stream_fn = dummyStreamFn;
+            return resp;
+        }
+        fn dummyStreamFn(_: ?*anyopaque, _: *std.Io.Writer) void {}
+    }.handle;
+    const resp = processRequest(0, &req, handler, test_io);
+    try testing.expectEqualStrings("close", resp.headers.get("Connection").?);
 }
 
 // /// formatUsize utility

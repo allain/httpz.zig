@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  GET  /users         - List users (compressed)\n", .{});
     std.debug.print("  GET  /users/:id     - Get user by ID (CORS enabled)\n", .{});
     std.debug.print("  POST /users         - Create user\n", .{});
+    std.debug.print("  GET  /stream        - Streaming response\n", .{});
     std.debug.print("  GET  /ws            - WebSocket echo endpoint\n", .{});
 
     var server = httpz.Server.init(.{
@@ -29,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .method = .GET, .path = "/users", .handler = compress.wrap(handleListUsers) },
         .{ .method = .GET, .path = "/users/:id", .handler = cors.wrap(handleGetUser) },
         .{ .method = .POST, .path = "/users", .handler = handleCreateUser },
+        .{ .method = .GET, .path = "/stream", .handler = compress.wrap(handleStream) },
         .{ .method = .GET, .path = "/ws", .handler = handleWsUpgrade, .ws = .{ .handler = wsHandler } },
     }));
 
@@ -81,6 +83,22 @@ fn handleCreateUser(_: *const httpz.Request, _: *const httpz.Router.Params, _: s
     return httpz.Response.init(.created, "application/json",
         \\{"id":4,"name":"New User"}
     );
+}
+
+fn handleStream(_: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
+    var resp: httpz.Response = .{ .status = .ok, .chunked = true };
+    resp.headers.append("Content-Type", "text/plain") catch {};
+    resp.stream_fn = streamFn;
+    return resp;
+}
+
+fn streamFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "line {d}\n", .{i}) catch return;
+        writer.writeAll(line) catch return;
+    }
 }
 
 fn handleWsUpgrade(request: *const httpz.Request, _: *const httpz.Router.Params, _: std.Io) httpz.Response {
