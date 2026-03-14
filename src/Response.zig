@@ -315,6 +315,151 @@ pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
     }
 }
 
+const Compression = @import("server/Compression.zig");
+
+/// Gzip-compress the response body in place.
+/// Sets Content-Encoding and Vary headers. If compression fails or
+/// produces a larger result, the response is left unchanged.
+/// The compressed body is heap-allocated and freed by `deinit()`.
+/// The server calls `deinit()` automatically after sending.
+pub fn gzip(self: *Response) void {
+    if (self.body.len == 0) return;
+    if (self.headers.get("Content-Encoding") != null) return;
+
+    const compressed = Compression.compress(self.body, std.heap.page_allocator) catch return;
+    if (compressed.len >= self.body.len) {
+        std.heap.page_allocator.free(compressed);
+        return;
+    }
+
+    // Free any previous allocation before replacing
+    self.deinit(std.heap.page_allocator);
+    self.body = compressed;
+    self._body_allocated = compressed;
+    self.headers.append("Content-Encoding", "gzip") catch {};
+    self.headers.append("Vary", "Accept-Encoding") catch {};
+}
+
+const ByteRange = @import("Request.zig").ByteRange;
+
+/// RFC 2616 Section 10.2.7: Build a 206 Partial Content response for a single range.
+/// Sets status 206 and adds Content-Range header.
+pub fn partialContent(body: []const u8, range: ByteRange, total: usize, content_type: []const u8) Response {
+    var resp: Response = .{
+        .status = .partial_content,
+    };
+    resp.headers.append("Content-Type", content_type) catch {};
+    const start = range.start orelse 0;
+    const end = range.end orelse (total - 1);
+    resp.body = body[start .. end + 1];
+    // Content-Range is stored via server_header_buf to keep stable lifetime
+    const cr = formatContentRange(start, end, total, resp.allocServerBuf(content_range_max_len).?);
+    resp.headers.append("Content-Range", cr) catch {};
+    return resp;
+}
+
+/// RFC 2616 Section 10.4.17: Build a 416 Range Not Satisfiable response.
+pub fn rangeNotSatisfiable(total_size: usize) Response {
+    var resp: Response = .{
+        .status = .requested_range_not_satisfiable,
+    };
+    const cr = formatContentRangeStar(total_size, resp.allocServerBuf(content_range_max_len).?);
+    resp.headers.append("Content-Range", cr) catch {};
+    return resp;
+}
+
+/// RFC 2616 Section 14.16: Format "bytes start-end/total".
+const content_range_max_len = 6 + 20 + 1 + 20 + 1 + 20; // "bytes " + start + "-" + end + "/" + total
+fn formatContentRange(start: usize, end: usize, total: usize, buf: []u8) []const u8 {
+    var pos: usize = 0;
+    const prefix = "bytes ";
+    @memcpy(buf[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+    pos += writeUsize(buf[pos..], start);
+    buf[pos] = '-';
+    pos += 1;
+    pos += writeUsize(buf[pos..], end);
+    buf[pos] = '/';
+    pos += 1;
+    pos += writeUsize(buf[pos..], total);
+    return buf[0..pos];
+}
+
+fn formatContentRangeStar(total: usize, buf: []u8) []const u8 {
+    var pos: usize = 0;
+    const prefix = "bytes */";
+    @memcpy(buf[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+    pos += writeUsize(buf[pos..], total);
+    return buf[0..pos];
+}
+
+fn writeUsize(buf: []u8, value: usize) usize {
+    var tmp: [20]u8 = undefined;
+    const s = formatUsize(value, &tmp);
+    @memcpy(buf[0..s.len], s);
+    return s.len;
+}
+
+/// Build a multipart/byteranges response for multiple ranges.
+/// The caller provides a scratch buffer `buf` for assembling the multipart body.
+pub fn multipartByteRanges(
+    content: []const u8,
+    content_type: []const u8,
+    ranges: []const ByteRange,
+    total: usize,
+    buf: []u8,
+) !Response {
+    const boundary = "httpz_range_boundary";
+    var pos: usize = 0;
+
+    for (ranges) |range| {
+        const start = range.start orelse 0;
+        const end = range.end orelse (total - 1);
+        const part_data = content[start .. end + 1];
+
+        // --boundary\r\n
+        pos = appendTo(buf, pos, "--") orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, boundary) orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+
+        // Content-Type: ...\r\n
+        pos = appendTo(buf, pos, "Content-Type: ") orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, content_type) orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+
+        // Content-Range: bytes start-end/total\r\n
+        pos = appendTo(buf, pos, "Content-Range: ") orelse return error.ResponseTooLarge;
+        var cr_buf: [content_range_max_len]u8 = undefined;
+        const cr = formatContentRange(start, end, total, &cr_buf);
+        pos = appendTo(buf, pos, cr) orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+
+        // \r\n + body data
+        pos = appendTo(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, part_data) orelse return error.ResponseTooLarge;
+        pos = appendTo(buf, pos, "\r\n") orelse return error.ResponseTooLarge;
+    }
+
+    // Closing boundary: --boundary--\r\n
+    pos = appendTo(buf, pos, "--") orelse return error.ResponseTooLarge;
+    pos = appendTo(buf, pos, boundary) orelse return error.ResponseTooLarge;
+    pos = appendTo(buf, pos, "--\r\n") orelse return error.ResponseTooLarge;
+
+    var resp: Response = .{
+        .status = .partial_content,
+        .body = buf[0..pos],
+    };
+    resp.headers.append("Content-Type", "multipart/byteranges; boundary=" ++ boundary) catch {};
+    return resp;
+}
+
+fn appendTo(buf: []u8, pos: usize, data: []const u8) ?usize {
+    if (pos + data.len > buf.len) return null;
+    @memcpy(buf[pos..][0..data.len], data);
+    return pos + data.len;
+}
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -608,4 +753,65 @@ test "Response: formatInt" {
 
     len = formatInt(65535, &buf);
     try testing.expectEqualStrings("65535", buf[0..len]);
+}
+
+// RFC 2616 Section 10.2.7: partialContent builds 206 with Content-Range
+test "Response: partialContent" {
+    const body = "Hello, World!";
+    const resp = Response.partialContent(body, .{ .start = 0, .end = 4 }, 13, "text/plain");
+    try testing.expectEqual(StatusCode.partial_content, resp.status);
+    try testing.expectEqualStrings("Hello", resp.body);
+    const cr = resp.headers.get("Content-Range").?;
+    try testing.expect(std.mem.startsWith(u8, cr, "bytes 0-4/13"));
+}
+
+// RFC 2616 Section 10.4.17: rangeNotSatisfiable returns 416
+test "Response: rangeNotSatisfiable" {
+    const resp = Response.rangeNotSatisfiable(1000);
+    try testing.expectEqual(StatusCode.requested_range_not_satisfiable, resp.status);
+    const cr = resp.headers.get("Content-Range").?;
+    try testing.expect(std.mem.startsWith(u8, cr, "bytes */1000"));
+}
+
+// Multipart byte ranges
+test "Response: multipartByteRanges" {
+    const content = "Hello, World!";
+    const ranges = [_]ByteRange{
+        .{ .start = 0, .end = 4 },
+        .{ .start = 7, .end = 11 },
+    };
+    var buf: [4096]u8 = undefined;
+    const resp = try Response.multipartByteRanges(content, "text/plain", &ranges, 13, &buf);
+    try testing.expectEqual(StatusCode.partial_content, resp.status);
+    // Content-Type should be multipart/byteranges
+    const ct = resp.headers.get("Content-Type").?;
+    try testing.expect(std.mem.startsWith(u8, ct, "multipart/byteranges"));
+    // Body should contain both parts
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Hello") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "World") != null);
+}
+
+// Response.gzip compresses body in place
+test "Response: gzip compresses body" {
+    // Use a body large enough that gzip actually shrinks it
+    const body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var resp = Response.init(.ok, "text/plain", body);
+    resp.gzip();
+    defer resp.deinit(std.heap.page_allocator);
+
+    try testing.expect(resp.body.len < body.len);
+    try testing.expectEqualStrings("gzip", resp.headers.get("Content-Encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", resp.headers.get("Vary").?);
+    try testing.expect(resp._body_allocated != null);
+}
+
+// Response.gzip is a no-op on empty body
+test "Response: gzip no-op on empty body" {
+    var resp = Response.init(.ok, "text/plain", "");
+    resp.gzip();
+    try testing.expectEqualStrings("", resp.body);
+    try testing.expect(resp.headers.get("Content-Encoding") == null);
 }

@@ -8,6 +8,7 @@ const Connection = @import("Connection.zig");
 const Headers = @import("../Headers.zig");
 const Date = @import("Date.zig");
 const Proxy = @import("Proxy.zig");
+const WebSocket = @import("WebSocket.zig");
 
 /// RFC 2616 Section 1.4: HTTP/1.1 server implementation.
 ///
@@ -65,6 +66,9 @@ pub const Config = struct {
     enable_proxy: bool = false,
     /// Proxy access control settings. Only used when enable_proxy is true.
     proxy: ProxyConfig = .{},
+    /// WebSocket handler. When set, responses with status 101 trigger
+    /// a WebSocket session using this handler.
+    websocket_handler: ?WebSocket.Handler = null,
     /// TLS configuration for HTTPS support.
     /// When set, the server performs a TLS handshake on each accepted
     /// connection and serves HTTP over the encrypted channel.
@@ -93,6 +97,14 @@ pub const RunError = error{AddressInUse};
 
 pub fn run(self: *Server, io: Io) RunError!void {
     const addr = Io.net.IpAddress.parseIp4(self.config.address, self.config.port) catch return error.AddressInUse;
+
+    // Check if something is already listening on this port.
+    // reuse_address allows binding even when another process holds the port,
+    // so we probe with a connect first.
+    if (Io.net.IpAddress.connect(addr, io, .{ .mode = .stream })) |probe| {
+        probe.close(io);
+        return error.AddressInUse;
+    } else |_| {}
 
     var server = Io.net.IpAddress.listen(addr, io, .{ .reuse_address = true }) catch return error.AddressInUse;
     defer server.deinit(io);
@@ -374,6 +386,19 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // TLS writer flush encrypts into the buffered TCP writer;
         // flush the TCP layer so the response actually reaches the client.
         if (tls_conn != null) net_writer.interface.flush() catch return;
+
+        // Free any allocated body (e.g. from gzip compression)
+        response.deinit(std.heap.page_allocator);
+
+        // RFC 6455: WebSocket upgrade — hand off to WebSocket handler
+        if (response.status == .switching_protocols) {
+            if (self.config.websocket_handler) |ws_handler| {
+                var ws_buf: [65536]u8 = undefined;
+                var ws_conn = WebSocket.Conn.init(reader, writer, &ws_buf);
+                ws_handler(&ws_conn, &request);
+            }
+            return;
+        }
 
         // RFC 2616 Section 8.1: Check if connection should persist
         if (!Connection.shouldKeepAlive(&request)) {

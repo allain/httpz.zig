@@ -96,7 +96,11 @@ pub fn processRequestWithOptions(timestamp: i64, request: *const Request, handle
     // RFC 2616 Section 13.5.1 / 14.10: Remove hop-by-hop headers from the
     // response. Also parse the Connection header for additional hop-by-hop
     // header names specified by the client.
-    removeHopByHopHeaders(&response.headers, request);
+    // RFC 6455: Skip for 101 Switching Protocols — Upgrade and Connection
+    // headers must be preserved for WebSocket handshake.
+    if (response.status != .switching_protocols) {
+        removeHopByHopHeaders(&response.headers, request);
+    }
 
     // RFC 2616 Section 8.1.2.1: Connection header.
     if (!shouldKeepAlive(request)) {

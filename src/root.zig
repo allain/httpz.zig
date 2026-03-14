@@ -13,6 +13,7 @@ pub const Client = @import("client/Client.zig");
 pub const Request = @import("Request.zig");
 pub const Response = @import("Response.zig");
 pub const Headers = @import("Headers.zig");
+pub const WebSocket = @import("server/WebSocket.zig");
 
 const std = @import("std");
 

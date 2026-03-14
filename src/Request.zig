@@ -447,6 +447,50 @@ pub fn parseRange(self: *const Request, total_size: usize) ?ByteRange {
     return .{ .start = start, .end = @min(end, total_size - 1) };
 }
 
+/// RFC 2616 Section 14.35: Parse all byte ranges from a Range header.
+/// Format: "bytes=0-499,500-999,-100"
+/// Returns the number of valid ranges written to `buf`, or null if no
+/// Range header is present or it is malformed.
+pub fn parseRanges(self: *const Request, total_size: usize, buf: []ByteRange) ?usize {
+    const range_header = self.headers.get("Range") orelse return null;
+    const trimmed_header = trimOws(range_header);
+
+    if (!std.mem.startsWith(u8, trimmed_header, "bytes=")) return null;
+    const spec = trimmed_header[6..];
+
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |range_raw| {
+        if (count >= buf.len) break;
+        const range_str = trimOws(range_raw);
+        if (range_str.len == 0) continue;
+
+        const dash = std.mem.indexOfScalar(u8, range_str, '-') orelse return null;
+
+        if (dash == 0) {
+            // Suffix range: "-500"
+            const suffix_len = std.fmt.parseInt(usize, range_str[1..], 10) catch return null;
+            if (suffix_len == 0 or suffix_len > total_size) return null;
+            buf[count] = .{ .start = total_size - suffix_len, .end = total_size - 1 };
+        } else {
+            const start = std.fmt.parseInt(usize, range_str[0..dash], 10) catch return null;
+            if (start >= total_size) return null;
+
+            if (dash + 1 >= range_str.len) {
+                buf[count] = .{ .start = start, .end = total_size - 1 };
+            } else {
+                const end = std.fmt.parseInt(usize, range_str[dash + 1 ..], 10) catch return null;
+                if (end < start) return null;
+                buf[count] = .{ .start = start, .end = @min(end, total_size - 1) };
+            }
+        }
+        count += 1;
+    }
+
+    if (count == 0) return null;
+    return count;
+}
+
 /// RFC 2616 Section 14.26: Check If-None-Match against an ETag.
 /// Returns true if the request ETag matches (resource not modified).
 /// Handles comma-separated ETag lists: `If-None-Match: "a", "b", "c"`
@@ -1758,4 +1802,63 @@ test "Request: invalid Host header rejected" {
     try testing.expectError(error.InvalidHostHeader, Request.parseConst(
         "GET / HTTP/1.1\r\nHost: user@example.com\r\n\r\n",
     ));
+}
+
+// RFC 2616 Section 14.35: Multi-range parsing
+test "Request: parseRanges multi-range" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Range: bytes=0-499,500-999\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    var ranges: [8]ByteRange = undefined;
+    const count = req.parseRanges(1000, &ranges).?;
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(usize, 0), ranges[0].start.?);
+    try testing.expectEqual(@as(usize, 499), ranges[0].end.?);
+    try testing.expectEqual(@as(usize, 500), ranges[1].start.?);
+    try testing.expectEqual(@as(usize, 999), ranges[1].end.?);
+}
+
+test "Request: parseRanges single range" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Range: bytes=0-99\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    var ranges: [8]ByteRange = undefined;
+    const count = req.parseRanges(1000, &ranges).?;
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(usize, 0), ranges[0].start.?);
+    try testing.expectEqual(@as(usize, 99), ranges[0].end.?);
+}
+
+test "Request: parseRanges suffix range" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Range: bytes=-100\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    var ranges: [8]ByteRange = undefined;
+    const count = req.parseRanges(1000, &ranges).?;
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(usize, 900), ranges[0].start.?);
+    try testing.expectEqual(@as(usize, 999), ranges[0].end.?);
+}
+
+test "Request: parseRanges no header" {
+    const raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    var ranges: [8]ByteRange = undefined;
+    try testing.expect(req.parseRanges(1000, &ranges) == null);
 }

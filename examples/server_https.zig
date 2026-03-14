@@ -48,10 +48,13 @@ pub fn main(init: std.process.Init) !void {
 
 fn handler(request: *const httpz.Request, _: std.Io) httpz.Response {
     if (std.mem.eql(u8, request.uri, "/")) {
-        return httpz.Response.init(.ok, "text/plain", "Hello from httpsz!");
+        var resp = httpz.Response.init(.ok, "text/plain", "Hello from httpsz!");
+        if (request.acceptsEncoding("gzip")) resp.gzip();
+        return resp;
     }
 
     if (std.mem.eql(u8, request.uri, "/health")) {
+        // No compression for small JSON responses
         return httpz.Response.init(.ok, "application/json", "{\"status\":\"ok\"}");
     }
 
