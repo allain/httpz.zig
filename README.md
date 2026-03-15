@@ -47,7 +47,7 @@ Handlers receive a per-request arena allocator, an `std.Io` instance, and the pa
 ## Using as a Dependency
 
 ```sh
-zig fetch --save git+https://github.com/allain/httpz
+zig fetch --save git+https://github.com/allain/httpz.zig
 ```
 
 Then in your `build.zig`:
