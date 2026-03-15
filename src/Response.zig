@@ -155,8 +155,10 @@ pub fn allocServerBuf(self: *Response, len: usize) ?[]u8 {
     return self.server_header_buf[start..][0..len];
 }
 
-/// Maximum response size (status line + headers + body separator)
-pub const max_response_len = 65536;
+/// Maximum size for serialized response headers (status line + headers + CRLF).
+/// Body is written separately to the network writer, so this only needs to
+/// cover the header section.
+pub const max_response_header_len = 65536;
 
 pub const SerializeError = error{
     ResponseTooLarge,

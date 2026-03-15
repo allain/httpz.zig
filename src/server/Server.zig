@@ -252,7 +252,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 writer.flush() catch return;
             } else {
                 const resp: Response = .{ .status = .expectation_failed, .body = "Expectation Failed" };
-                var resp_buf: [Response.max_response_len]u8 = undefined;
+                var resp_buf: [Response.max_response_header_len]u8 = undefined;
                 const resp_data = resp.serialize(&resp_buf) catch return;
                 writer.writeAll(resp_data) catch return;
                 writer.flush() catch return;
@@ -270,7 +270,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             !Headers.eqlIgnoreCase(te.?, "identity"))
         {
             const resp: Response = .{ .status = .not_implemented, .body = "Unsupported Transfer-Encoding" };
-            var resp_buf: [Response.max_response_len]u8 = undefined;
+            var resp_buf: [Response.max_response_header_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
             writer.writeAll(resp_data) catch return;
             writer.flush() catch return;
@@ -282,7 +282,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             total = readChunkedBody(reader, &request_buf, total, self.config.max_request_size) catch |err| switch (err) {
                 error.EndOfStream => {
                     const resp: Response = .{ .status = .bad_request, .body = "Incomplete chunked body" };
-                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    var resp_buf: [Response.max_response_header_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
                     writer.writeAll(resp_data) catch return;
                     writer.flush() catch return;
@@ -291,7 +291,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 error.ReadFailed => return error.ReadFailed,
                 error.BodyTooLarge => {
                     const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
-                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    var resp_buf: [Response.max_response_header_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
                     writer.writeAll(resp_data) catch return;
                     writer.flush() catch return;
@@ -299,7 +299,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 },
                 error.InvalidChunkedEncoding => {
                     const resp: Response = .{ .status = .bad_request, .body = "Invalid chunked body" };
-                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    var resp_buf: [Response.max_response_header_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
                     writer.writeAll(resp_data) catch return;
                     writer.flush() catch return;
@@ -311,7 +311,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             if (cl) |body_len| {
                 if (body_len > self.config.max_request_size - header_len) {
                     const resp: Response = .{ .status = .request_entity_too_large, .body = "Request Entity Too Large" };
-                    var resp_buf: [Response.max_response_len]u8 = undefined;
+                    var resp_buf: [Response.max_response_header_len]u8 = undefined;
                     const resp_data = resp.serialize(&resp_buf) catch return;
                     writer.writeAll(resp_data) catch return;
                     writer.flush() catch return;
@@ -347,7 +347,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
                 else => .bad_request,
             };
             const resp: Response = .{ .status = status, .body = status.reason() };
-            var resp_buf: [Response.max_response_len]u8 = undefined;
+            var resp_buf: [Response.max_response_header_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
             writer.writeAll(resp_data) catch return;
             writer.flush() catch return;
@@ -377,7 +377,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         }
 
         // Serialize and send response
-        var resp_buf: [Response.max_response_len]u8 = undefined;
+        var resp_buf: [Response.max_response_header_len]u8 = undefined;
 
         if (response.stream_fn) |stream_fn| {
             // Streaming response path: send headers, then call stream_fn
@@ -403,15 +403,30 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             return;
         }
 
-        const resp_data = response.serialize(&resp_buf) catch {
+        const header_data = response.serializeHeaders(&resp_buf) catch {
             const err_resp: Response = .{ .status = .internal_server_error, .body = "Internal Server Error" };
-            const err_data = err_resp.serialize(&resp_buf) catch return;
+            const err_data = err_resp.serializeHeaders(&resp_buf) catch return;
             writer.writeAll(err_data) catch return;
             writer.flush() catch return;
             return;
         };
 
-        writer.writeAll(resp_data) catch return;
+        writer.writeAll(header_data) catch return;
+        if (!response.strip_body) {
+            if (response.chunked and response.body.len > 0) {
+                // RFC 2616 Section 3.6.1: Encode body as a single chunk
+                var chunk_size_buf: [20]u8 = undefined;
+                const chunk_size_str = std.fmt.bufPrint(&chunk_size_buf, "{x}", .{response.body.len}) catch return;
+                writer.writeAll(chunk_size_str) catch return;
+                writer.writeAll("\r\n") catch return;
+                writer.writeAll(response.body) catch return;
+                writer.writeAll("\r\n0\r\n\r\n") catch return;
+            } else if (response.chunked) {
+                writer.writeAll("0\r\n\r\n") catch return;
+            } else {
+                writer.writeAll(response.body) catch return;
+            }
+        }
         writer.flush() catch return;
         // TLS writer flush encrypts into the buffered TCP writer;
         // flush the TCP layer so the response actually reaches the client.
@@ -462,7 +477,7 @@ fn rejectBusyConnection(stream: Io.net.Stream, io: Io) void {
         .status = .service_unavailable,
         .body = "Server busy",
     };
-    var resp_buf: [Response.max_response_len]u8 = undefined;
+    var resp_buf: [Response.max_response_header_len]u8 = undefined;
     const resp_data = resp.serialize(&resp_buf) catch return;
     writer.interface.writeAll(resp_data) catch return;
     writer.interface.flush() catch return;
@@ -479,7 +494,7 @@ fn rejectBusyConnection(stream: Io.net.Stream, io: Io) void {
 fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *const Request, client_writer: *Io.net.Stream.Writer) !void {
     const authority = Proxy.parseAuthority(request.uri) orelse {
         const resp: Response = .{ .status = .bad_request, .body = "Invalid CONNECT authority" };
-        var resp_buf: [Response.max_response_len]u8 = undefined;
+        var resp_buf: [Response.max_response_header_len]u8 = undefined;
         const resp_data = resp.serialize(&resp_buf) catch return;
         client_writer.interface.writeAll(resp_data) catch return;
         client_writer.interface.flush() catch return;
@@ -498,7 +513,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
         }
         if (!port_allowed) {
             const resp: Response = .{ .status = .forbidden, .body = "Port not allowed" };
-            var resp_buf: [Response.max_response_len]u8 = undefined;
+            var resp_buf: [Response.max_response_header_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
             client_writer.interface.writeAll(resp_data) catch return;
             client_writer.interface.flush() catch return;
@@ -517,7 +532,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
         }
         if (!host_allowed) {
             const resp: Response = .{ .status = .forbidden, .body = "Host not allowed" };
-            var resp_buf: [Response.max_response_len]u8 = undefined;
+            var resp_buf: [Response.max_response_header_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
             client_writer.interface.writeAll(resp_data) catch return;
             client_writer.interface.flush() catch return;
@@ -529,7 +544,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
     if (proxy_cfg.block_private_ips) {
         if (isPrivateIp(authority.host)) {
             const resp: Response = .{ .status = .forbidden, .body = "Private IP targets not allowed" };
-            var resp_buf: [Response.max_response_len]u8 = undefined;
+            var resp_buf: [Response.max_response_header_len]u8 = undefined;
             const resp_data = resp.serialize(&resp_buf) catch return;
             client_writer.interface.writeAll(resp_data) catch return;
             client_writer.interface.flush() catch return;
@@ -540,7 +555,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
     // Connect to the target server.
     const target_addr = Io.net.IpAddress.parseIp4(authority.host, authority.port) catch {
         const resp: Response = .{ .status = .bad_gateway, .body = "Cannot resolve target" };
-        var resp_buf: [Response.max_response_len]u8 = undefined;
+        var resp_buf: [Response.max_response_header_len]u8 = undefined;
         const resp_data = resp.serialize(&resp_buf) catch return;
         client_writer.interface.writeAll(resp_data) catch return;
         client_writer.interface.flush() catch return;
@@ -549,7 +564,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
 
     const target_stream = Io.net.IpAddress.connect(target_addr, io, .{ .mode = .stream }) catch {
         const resp: Response = .{ .status = .bad_gateway, .body = "Connection to target failed" };
-        var resp_buf: [Response.max_response_len]u8 = undefined;
+        var resp_buf: [Response.max_response_header_len]u8 = undefined;
         const resp_data = resp.serialize(&resp_buf) catch return;
         client_writer.interface.writeAll(resp_data) catch return;
         client_writer.interface.flush() catch return;

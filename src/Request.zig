@@ -290,7 +290,6 @@ pub fn parse(data: []u8) ParseError!Request {
         }
         const content_length = std.fmt.parseInt(usize, trimOws(cl_str), 10) catch
             return error.InvalidContentLength;
-        if (content_length > max_body_len) return error.BodyTooLarge;
         if (pos + content_length > data.len) return error.UnexpectedEndOfInput;
         request.body = data[pos..][0..content_length];
     }
