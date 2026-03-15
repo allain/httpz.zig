@@ -12,6 +12,7 @@ An HTTP/1.1 library for Zig 0.16, built on the `std.Io` async model.
 - **Middleware** — CORS and gzip compression via composable `wrap` functions
 - **HTTPS / TLS** — server and client TLS via [tls.zig](https://github.com/allain/tls.zig)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
+- **Cookies** — RFC 6265 cookie parsing and Set-Cookie generation with Secure, HttpOnly, SameSite, Max-Age, Domain, Path
 - **RFC 2616 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
 
 ## Quick Start
@@ -184,6 +185,76 @@ httpz.middleware.cors.init(.{
     .max_age = "86400",                                       // Access-Control-Max-Age (seconds)
 });
 ```
+
+## Cookies
+
+`httpz.Cookie` provides RFC 6265 cookie parsing from requests and `Set-Cookie` header generation for responses.
+
+### Reading Cookies
+
+```zig
+fn handler(allocator: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
+    // Look up a single cookie by name
+    const session = httpz.Cookie.get(request, "session_id") orelse
+        return httpz.Response.init(.unauthorized, "text/plain", "No session");
+
+    // Iterate all cookies
+    var iter = httpz.Cookie.iterator(request);
+    while (iter.next()) |cookie| {
+        std.debug.print("{s} = {s}\n", .{ cookie.name, cookie.value });
+    }
+
+    _ = session;
+    _ = allocator;
+    return httpz.Response.init(.ok, "text/plain", "OK");
+}
+```
+
+### Setting Cookies
+
+```zig
+fn login(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
+    var resp = httpz.Response.init(.ok, "text/plain", "Logged in");
+
+    // Session cookie — expires when browser closes
+    httpz.Cookie.set(&resp, allocator, .{
+        .name = "session_id",
+        .value = "abc123",
+        .path = "/",
+        .http_only = true,
+        .secure = true,
+        .same_site = .lax,
+    }) catch {};
+
+    // Persistent cookie — 30 day expiry
+    httpz.Cookie.set(&resp, allocator, .{
+        .name = "preferences",
+        .value = "dark_mode",
+        .path = "/",
+        .max_age = 86400 * 30,
+    }) catch {};
+
+    return resp;
+}
+```
+
+### Deleting Cookies
+
+```zig
+fn logout(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
+    var resp = httpz.Response.init(.ok, "text/plain", "Logged out");
+
+    // Domain and Path must match the original cookie
+    httpz.Cookie.remove(&resp, allocator, .{
+        .name = "session_id",
+        .path = "/",
+    }) catch {};
+
+    return resp;
+}
+```
+
+The allocator is used to format `Set-Cookie` header values. Use a per-request arena so the memory lives until the response is serialized.
 
 ## Streaming Responses
 
