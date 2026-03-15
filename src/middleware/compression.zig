@@ -10,8 +10,8 @@ const flate = std.compress.flate;
 /// when the client accepts gzip and the content type is compressible.
 pub fn wrap(comptime inner: Router.RouteHandler) Router.RouteHandler {
     return struct {
-        fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request, params: *const Router.Params) Response {
-            var resp = inner(allocator, io, req, params);
+        fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
+            var resp = inner(allocator, io, req);
             if (req.acceptsEncoding("gzip")) {
                 const ct = resp.headers.get("Content-Type") orelse "";
                 if (Compression.isCompressible(ct)) {
@@ -110,7 +110,7 @@ const testing = std.testing;
 
 test "compression middleware: wraps route handler and compresses" {
     const inner = struct {
-        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             // Use a body large enough that gzip actually shrinks it
             return Response.init(.ok, "text/plain",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
@@ -129,9 +129,7 @@ test "compression middleware: wraps route handler and compresses" {
             "\r\n",
     );
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
-    var params: Router.Params = .{};
-
-    var resp = wrapped(std.testing.allocator, test_io, &req, &params);
+    var resp = wrapped(std.testing.allocator, test_io, &req);
     defer resp.deinit(std.testing.allocator);
 
     try testing.expectEqualStrings("gzip", resp.headers.get("Content-Encoding").?);
@@ -140,7 +138,7 @@ test "compression middleware: wraps route handler and compresses" {
 
 test "compression middleware: skips when not accepted" {
     const inner = struct {
-        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return Response.init(.ok, "text/plain",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -155,15 +153,13 @@ test "compression middleware: skips when not accepted" {
             "\r\n",
     );
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
-    var params: Router.Params = .{};
-
-    const resp = wrapped(std.testing.allocator, test_io, &req, &params);
+    const resp = wrapped(std.testing.allocator, test_io, &req);
     try testing.expect(resp.headers.get("Content-Encoding") == null);
 }
 
 test "compression middleware: skips non-compressible content types" {
     const inner = struct {
-        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Router.Params) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return Response.init(.ok, "image/png",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -179,8 +175,6 @@ test "compression middleware: skips non-compressible content types" {
             "\r\n",
     );
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
-    var params: Router.Params = .{};
-
-    const resp = wrapped(std.testing.allocator, test_io, &req, &params);
+    const resp = wrapped(std.testing.allocator, test_io, &req);
     try testing.expect(resp.headers.get("Content-Encoding") == null);
 }

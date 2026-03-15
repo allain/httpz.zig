@@ -5,24 +5,11 @@ const Response = @import("Response.zig");
 const Connection = @import("server/Connection.zig");
 const WebSocket = @import("server/WebSocket.zig");
 
-/// Path parameters extracted from a matched route.
-pub const Params = struct {
-    entries: [max_params]Entry = undefined,
-    len: usize = 0,
+/// Re-export Params from Request for backwards compatibility.
+pub const Params = Request.Params;
 
-    pub const max_params = 8;
-    pub const Entry = struct { name: []const u8, value: []const u8 };
-
-    pub fn get(self: *const Params, name: []const u8) ?[]const u8 {
-        for (self.entries[0..self.len]) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) return entry.value;
-        }
-        return null;
-    }
-};
-
-/// Route handler that receives path parameters.
-pub const RouteHandler = *const fn (std.mem.Allocator, std.Io, *const Request, *const Params) Response;
+/// Route handler — same signature as Connection.Handler.
+pub const RouteHandler = *const fn (std.mem.Allocator, std.Io, *const Request) Response;
 
 /// A single route definition.
 pub const Route = struct {
@@ -47,7 +34,9 @@ pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: R
             inline for (routes) |route| {
                 if (request.method == route.method) {
                     if (matchPath(route.path, path)) |params| {
-                        var response = route.handler(allocator, io, request, &params);
+                        var mutable_req = request.*;
+                        mutable_req.params = params;
+                        var response = route.handler(allocator, io, &mutable_req);
                         if (route.ws) |ws| {
                             response.ws_handler = ws.handler;
                         }
@@ -56,13 +45,12 @@ pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: R
                 }
             }
 
-            var params: Params = .{};
-            return not_found(allocator, io, request, &params);
+            return not_found(allocator, io, request);
         }
     }.dispatch;
 }
 
-fn defaultNotFound(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+fn defaultNotFound(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
     return Response.init(.not_found, "text/plain", "Not Found");
 }
 
@@ -256,17 +244,17 @@ test "Router: Params.get" {
 test "Router: dispatch selects correct handler" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
                 return Response.init(.ok, "text/plain", "home");
             }
         }.h },
         .{ .method = .GET, .path = "/users/:id", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, params: *const Params) Response {
-                return Response.init(.ok, "text/plain", params.get("id") orelse "none");
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", request.params.get("id") orelse "none");
             }
         }.h },
         .{ .method = .POST, .path = "/users", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
                 return Response.init(.created, "text/plain", "created");
             }
         }.h },
@@ -299,14 +287,14 @@ test "Router: dispatch selects correct handler" {
 test "Router: custom 404 fallback" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
                 return Response.init(.ok, "text/plain", "home");
             }
         }.h },
     };
 
     const custom_404 = struct {
-        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return Response.init(.not_found, "text/html", "<h1>Custom 404</h1>");
         }
     }.h;
@@ -322,7 +310,7 @@ test "Router: custom 404 fallback" {
 test "Router: dispatch with query string" {
     const routes = [_]Route{
         .{ .method = .GET, .path = "/search", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request, _: *const Params) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
                 return Response.init(.ok, "text/plain", "search");
             }
         }.h },
@@ -343,7 +331,7 @@ test "Router: ws_handler is set on response" {
 
     const routes = [_]Route{
         .{ .method = .GET, .path = "/ws", .handler = struct {
-            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request, _: *const Params) Response {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
                 return WebSocket.upgradeResponse(request) orelse
                     Response.init(.bad_request, "text/plain", "upgrade failed");
             }

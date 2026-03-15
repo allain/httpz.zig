@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     return httpz.Response.init(.ok, "text/html",
         \\<!DOCTYPE html><html><body>
         \\<h1>httpz Streaming Example</h1>
@@ -41,7 +41,7 @@ fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *cons
 }
 
 /// SSE endpoint — streams events until the connection is closed.
-fn handleEvents(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleEvents(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok };
     resp.headers.append("Content-Type", "text/event-stream") catch {};
     resp.headers.append("Cache-Control", "no-cache") catch {};
@@ -61,7 +61,7 @@ fn sseStreamFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
 }
 
 /// Stream a large generated response without buffering everything in memory.
-fn handleLarge(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleLarge(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok, .chunked = true };
     resp.headers.append("Content-Type", "text/plain") catch {};
     resp.stream_fn = largeStreamFn;

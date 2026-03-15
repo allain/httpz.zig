@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     return httpz.Response.init(.ok, "text/html",
         \\<!DOCTYPE html><html><body>
         \\<h1>httpz Router Example</h1>
@@ -54,14 +54,14 @@ fn handleHome(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *cons
     );
 }
 
-fn handleListUsers(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleListUsers(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     return httpz.Response.init(.ok, "application/json",
         \\[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"},{"id":3,"name":"Charlie"}]
     );
 }
 
-fn handleGetUser(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request, params: *const httpz.Router.Params) httpz.Response {
-    const id = params.get("id") orelse
+fn handleGetUser(allocator: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
+    const id = request.params.get("id") orelse
         return httpz.Response.init(.bad_request, "text/plain", "Missing id");
     var buf: [128]u8 = undefined;
     const body = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"name\":\"User {s}\"}}", .{ id, id }) catch
@@ -77,13 +77,13 @@ fn handleGetUser(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Reques
     return resp;
 }
 
-fn handleCreateUser(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleCreateUser(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     return httpz.Response.init(.created, "application/json",
         \\{"id":4,"name":"New User"}
     );
 }
 
-fn handleStream(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleStream(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
     var resp: httpz.Response = .{ .status = .ok, .chunked = true };
     resp.headers.append("Content-Type", "text/plain") catch {};
     resp.stream_fn = streamFn;
@@ -99,7 +99,7 @@ fn streamFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
     }
 }
 
-fn handleWsUpgrade(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request, _: *const httpz.Router.Params) httpz.Response {
+fn handleWsUpgrade(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
     return httpz.WebSocket.upgradeResponse(request) orelse
         httpz.Response.init(.bad_request, "text/plain", "WebSocket upgrade required");
 }

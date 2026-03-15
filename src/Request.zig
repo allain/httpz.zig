@@ -72,6 +72,66 @@ body: []const u8 = "",
 /// Raw request bytes (request-line + headers + terminator).
 /// Used by TRACE to echo the received message (RFC 2616 §9.8).
 raw: []const u8 = "",
+/// Path parameters extracted from route matching.
+params: Params = .{},
+/// Type-keyed context for middleware to pass state to handlers.
+context: Context = .{},
+
+/// Type-keyed store for middleware state. Each middleware sets a value
+/// under its own type; handlers retrieve it with `get`. Uses `@typeName`
+/// pointer identity for O(1) key comparison.
+pub const Context = struct {
+    entries: [max_entries]Entry = undefined,
+    len: usize = 0,
+
+    pub const max_entries = 8;
+
+    const Entry = struct {
+        key: *const anyopaque,
+        value: *anyopaque,
+    };
+
+    /// Store a pointer to `T`, keyed by its type. Replaces any existing
+    /// entry for the same type.
+    pub fn put(self: *Context, comptime T: type, ptr: *T) void {
+        const key: *const anyopaque = @ptrCast(@typeName(T));
+        for (self.entries[0..self.len]) |*entry| {
+            if (entry.key == key) {
+                entry.value = @ptrCast(ptr);
+                return;
+            }
+        }
+        if (self.len < max_entries) {
+            self.entries[self.len] = .{ .key = key, .value = @ptrCast(ptr) };
+            self.len += 1;
+        }
+    }
+
+    /// Retrieve the value stored for type `T`, or null if not set.
+    pub fn get(self: *const Context, comptime T: type) ?*T {
+        const key: *const anyopaque = @ptrCast(@typeName(T));
+        for (self.entries[0..self.len]) |entry| {
+            if (entry.key == key) return @ptrCast(@alignCast(entry.value));
+        }
+        return null;
+    }
+};
+
+/// Path parameters extracted from a matched route.
+pub const Params = struct {
+    entries: [max_params]Entry = undefined,
+    len: usize = 0,
+
+    pub const max_params = 8;
+    pub const Entry = struct { name: []const u8, value: []const u8 };
+
+    pub fn get(self: *const Params, name: []const u8) ?[]const u8 {
+        for (self.entries[0..self.len]) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        }
+        return null;
+    }
+};
 
 pub const max_request_line_len = 8192;
 pub const max_header_line_len = 8192;
