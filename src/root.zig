@@ -15,6 +15,7 @@ pub const Response = @import("Response.zig");
 pub const Headers = @import("Headers.zig");
 pub const WebSocket = @import("server/WebSocket.zig");
 pub const Router = @import("Router.zig");
+pub const Handler = @import("server/Connection.zig").Handler;
 pub const middleware = struct {
     pub const compression = @import("middleware/compression.zig");
     pub const cors = @import("middleware/cors.zig");

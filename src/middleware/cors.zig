@@ -1,7 +1,6 @@
 const std = @import("std");
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
-const Router = @import("../Router.zig");
 const Connection = @import("../server/Connection.zig");
 
 pub const Config = struct {
@@ -12,27 +11,13 @@ pub const Config = struct {
 };
 
 /// Create a CORS middleware with the given configuration.
-/// Returns a struct with `wrap` and `wrapAll` functions.
+/// Returns a struct with a `wrap` function.
 pub fn init(comptime config: Config) type {
     return struct {
-        pub fn wrap(comptime inner: Router.RouteHandler) Router.RouteHandler {
+        pub fn wrap(comptime inner: Connection.Handler) Connection.Handler {
             return struct {
                 fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
                     // Handle OPTIONS preflight
-                    if (req.method == .OPTIONS) {
-                        return preflightResponse();
-                    }
-
-                    var resp = inner(allocator, io, req);
-                    addCorsHeaders(&resp);
-                    return resp;
-                }
-            }.handle;
-        }
-
-        pub fn wrapAll(comptime inner: Connection.Handler) Connection.Handler {
-            return struct {
-                fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
                     if (req.method == .OPTIONS) {
                         return preflightResponse();
                     }

@@ -5,17 +5,16 @@ const Response = @import("Response.zig");
 const Connection = @import("server/Connection.zig");
 const WebSocket = @import("server/WebSocket.zig");
 
+pub const Handler = Connection.Handler;
+
 /// Re-export Params from Request for backwards compatibility.
 pub const Params = Request.Params;
-
-/// Route handler — same signature as Connection.Handler.
-pub const RouteHandler = *const fn (std.mem.Allocator, std.Io, *const Request) Response;
 
 /// A single route definition.
 pub const Route = struct {
     method: Request.Method,
     path: []const u8,
-    handler: RouteHandler,
+    handler: Handler,
     ws: ?struct { handler: WebSocket.Handler } = null,
 };
 
@@ -26,7 +25,7 @@ pub fn handler(comptime routes: []const Route) Connection.Handler {
 }
 
 /// Build a Connection.Handler with a custom fallback for unmatched routes.
-pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: RouteHandler) Connection.Handler {
+pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: Handler) Connection.Handler {
     return struct {
         fn dispatch(allocator: std.mem.Allocator, io: std.Io, request: *const Request) Response {
             const path = extractPath(request.uri);

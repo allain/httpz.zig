@@ -154,7 +154,7 @@ var router_started = std.atomic.Value(bool).init(false);
 
 fn ensurePlainServer() void {
     if (plain_started.cmpxchgStrong(false, true, .seq_cst, .seq_cst) == null) {
-        spawnServer(comptime httpz.middleware.compression.wrapAll(plainHandler), plain_port);
+        spawnServer(comptime httpz.middleware.compression.wrap(plainHandler), plain_port);
     }
     waitForPort(plain_port);
 }

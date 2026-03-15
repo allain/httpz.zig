@@ -9,7 +9,7 @@ An HTTP/1.1 library for Zig 0.16, built on the `std.Io` async model.
 - **Router** — path parameters (`:id`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
-- **Middleware** — CORS and gzip compression with per-route (`wrap`) and global (`wrapAll`) application
+- **Middleware** — CORS and gzip compression via composable `wrap` functions
 - **HTTPS / TLS** — server and client TLS via [tls.zig](https://github.com/allain/tls.zig)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
 - **RFC 2616 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
@@ -96,7 +96,7 @@ Use `Router.handlerWithFallback` to provide a custom 404 handler instead of the 
 
 ## Middleware
 
-Each middleware provides two wrappers: `wrap` for route handlers and `wrapAll` for plain handlers.
+`wrap` works on both route handlers and plain handlers — use it per-route or globally:
 
 ```zig
 const std = @import("std");
@@ -126,10 +126,10 @@ fn handleData(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Re
 }
 ```
 
-`wrapAll` applies middleware globally when not using the Router:
+To apply middleware globally without the Router:
 
 ```zig
-var server = httpz.Server.init(config, compress.wrapAll(handler));
+var server = httpz.Server.init(config, compress.wrap(handler));
 ```
 
 ### Passing State to Handlers
@@ -140,7 +140,7 @@ Middleware can attach typed state to `request.context` for downstream handlers. 
 const GeoInfo = struct { lat: f64, lon: f64 };
 const AuthInfo = struct { user_id: []const u8 };
 
-fn geoMiddleware(comptime inner: httpz.Router.RouteHandler) httpz.Router.RouteHandler {
+fn geoMiddleware(comptime inner: httpz.Handler) httpz.Handler {
     return struct {
         fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const httpz.Request) httpz.Response {
             var geo = GeoInfo{ .lat = 45.0, .lon = -73.0 }; // looked up from req IP
@@ -151,7 +151,7 @@ fn geoMiddleware(comptime inner: httpz.Router.RouteHandler) httpz.Router.RouteHa
     }.handle;
 }
 
-fn authMiddleware(comptime inner: httpz.Router.RouteHandler) httpz.Router.RouteHandler {
+fn authMiddleware(comptime inner: httpz.Handler) httpz.Handler {
     return struct {
         fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const httpz.Request) httpz.Response {
             var auth = AuthInfo{ .user_id = "alice" }; // parsed from header

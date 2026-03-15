@@ -1,34 +1,13 @@
 const std = @import("std");
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
-const Router = @import("../Router.zig");
 const Connection = @import("../server/Connection.zig");
 const Compression = @import("../server/Compression.zig");
 const flate = std.compress.flate;
 
-/// Wrap a route handler to automatically gzip-compress responses
+/// Wrap a handler to automatically gzip-compress responses
 /// when the client accepts gzip and the content type is compressible.
-pub fn wrap(comptime inner: Router.RouteHandler) Router.RouteHandler {
-    return struct {
-        fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
-            var resp = inner(allocator, io, req);
-            if (req.acceptsEncoding("gzip")) {
-                const ct = resp.headers.get("Content-Type") orelse "";
-                if (Compression.isCompressible(ct)) {
-                    if (resp.stream_fn != null) {
-                        wrapStreamingGzip(&resp);
-                    } else {
-                        compressBody(&resp, allocator);
-                    }
-                }
-            }
-            return resp;
-        }
-    }.handle;
-}
-
-/// Wrap a Connection.Handler to automatically gzip-compress responses.
-pub fn wrapAll(comptime inner: Connection.Handler) Connection.Handler {
+pub fn wrap(comptime inner: Connection.Handler) Connection.Handler {
     return struct {
         fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
             var resp = inner(allocator, io, req);
