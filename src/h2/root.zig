@@ -4,6 +4,7 @@ pub const hpack = @import("hpack.zig");
 pub const huffman = @import("huffman.zig");
 pub const Stream = @import("Stream.zig");
 pub const StreamRegistry = @import("StreamRegistry.zig");
+pub const ConnectionIO = @import("ConnectionIO.zig");
 pub const FlowControl = @import("FlowControl.zig");
 pub const Settings = @import("Settings.zig");
 
@@ -28,6 +29,7 @@ test {
     _ = @import("hpack_test.zig");
     _ = Stream;
     _ = StreamRegistry;
+    _ = ConnectionIO;
     _ = FlowControl;
     _ = Settings;
 }

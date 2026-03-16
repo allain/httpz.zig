@@ -71,7 +71,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 ### Tasks
 - [x] **Stream state machine** (`src/h2/Stream.zig`) — 7 states: idle → open → half-closed(local/remote) → closed, plus reserved(local/remote); recv/send transition methods; CloseReason tracking; isActive/isClosed helpers
 - [x] **Stream registry** (`src/h2/StreamRegistry.zig`) — Track active streams by ID (client=odd, server=even); enforce `max_concurrent_streams`; monotonically increasing IDs; GC of closed streams; GOAWAY handling
-- [ ] **Stream-level I/O** — Demultiplex incoming frames to correct stream; multiplex outgoing frames from concurrent streams; handle CONTINUATION frame sequences (no interleaving allowed)
+- [x] **Stream-level I/O** (`src/h2/ConnectionIO.zig`) — `FrameReader` demultiplexes incoming frames and assembles CONTINUATION sequences into complete header blocks; `FrameWriter` splits HEADERS and DATA across multiple frames when exceeding max_frame_size
 
 ### RFC References
 - §5.1 (stream states), §5.1.1 (stream identifiers), §5.1.2 (concurrency limits)
