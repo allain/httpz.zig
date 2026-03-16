@@ -82,11 +82,11 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Prevents fast senders from overwhelming receivers**
 
 ### Tasks
-- [ ] **Window tracking** — Per-stream and connection-level windows, initial size 65,535 bytes
-- [ ] **WINDOW_UPDATE sending** — Receiver replenishes windows after consuming DATA frames
-- [ ] **WINDOW_UPDATE receiving** — Sender tracks available window; block DATA sends when window exhausted
-- [ ] **SETTINGS_INITIAL_WINDOW_SIZE** — Apply to new streams; adjust existing streams on settings change
-- [ ] **Overflow protection** — Window > 2^31-1 = FLOW_CONTROL_ERROR; increment of 0 = FLOW_CONTROL_ERROR
+- [x] **Window tracking** — Per-stream and connection-level windows via `Window` struct; initial size 65,535 bytes
+- [x] **WINDOW_UPDATE sending** — `FlowController.recordRecv` tracks unacked bytes; triggers update at threshold
+- [x] **WINDOW_UPDATE receiving** — `FlowController.recvWindowUpdate` replenishes send window
+- [x] **SETTINGS_INITIAL_WINDOW_SIZE** — `Window.adjustInitial` applies delta to existing stream windows
+- [x] **Overflow protection** — Window > 2^31-1 = FlowControlError; effective window is min(connection, stream)
 
 ### RFC References
 - §5.2 (flow control), §6.9 (WINDOW_UPDATE), §6.9.1–6.9.3 (window mechanics)
@@ -97,18 +97,10 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Connection-level parameter exchange**
 
 ### Tasks
-- [ ] **SETTINGS frame processing** — Parse/emit 6-byte identifier+value pairs on stream 0
-- [ ] **All 6 defined settings**:
-  | ID | Setting | Default |
-  |---|---|---|
-  | 0x1 | HEADER_TABLE_SIZE | 4,096 |
-  | 0x2 | ENABLE_PUSH | 1 |
-  | 0x3 | MAX_CONCURRENT_STREAMS | unlimited |
-  | 0x4 | INITIAL_WINDOW_SIZE | 65,535 |
-  | 0x5 | MAX_FRAME_SIZE | 16,384 |
-  | 0x6 | MAX_HEADER_LIST_SIZE | unlimited |
-- [ ] **ACK mechanism** — Respond to peer SETTINGS with ACK (empty SETTINGS + ACK flag); settings take effect immediately on receipt; HPACK table size changes take effect on ACK
-- [ ] **Unknown settings** — MUST be ignored (forward compatibility)
+- [x] **SETTINGS frame processing** — `Settings.applyAll` parses payload; `Settings.encode` emits non-default values
+- [x] **All 6 defined settings** — header_table_size, enable_push, max_concurrent_streams, initial_window_size, max_frame_size, max_header_list_size with validation
+- [ ] **ACK mechanism** — Respond to peer SETTINGS with ACK; HPACK table size changes take effect on ACK (wiring in Phase 6)
+- [x] **Unknown settings** — Ignored per RFC 9113 §6.5.2
 
 ### RFC References
 - §6.5 (SETTINGS), §6.5.2 (defined settings), §6.5.3 (synchronization)

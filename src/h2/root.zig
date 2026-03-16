@@ -3,6 +3,8 @@ pub const errors = @import("errors.zig");
 pub const hpack = @import("hpack.zig");
 pub const Stream = @import("Stream.zig");
 pub const StreamRegistry = @import("StreamRegistry.zig");
+pub const FlowControl = @import("FlowControl.zig");
+pub const Settings = @import("Settings.zig");
 
 pub const FrameType = frame.FrameType;
 pub const FrameHeader = frame.FrameHeader;
@@ -23,4 +25,6 @@ test {
     _ = hpack;
     _ = Stream;
     _ = StreamRegistry;
+    _ = FlowControl;
+    _ = Settings;
 }
