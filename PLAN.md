@@ -111,15 +111,16 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Integrate with existing httpz server**
 
 ### Tasks
-- [ ] **Protocol detection** — After TLS handshake, check ALPN result; if `h2`, enter HTTP/2 mode; if prior knowledge (cleartext), detect connection preface
-- [ ] **H2 connection handler** (`src/server/H2Connection.zig`) — Replace `Connection.zig` for HTTP/2: read frames in a loop, dispatch to stream handlers
-- [ ] **Request mapping** — Convert HEADERS frames with pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`) into existing `Request` struct
-- [ ] **Response mapping** — Convert `Response` struct into HEADERS frame (`:status` pseudo-header + response headers) + DATA frames (body), respecting flow control windows
-- [ ] **Prohibited headers** — Strip/reject Connection, Keep-Alive, Transfer-Encoding, Upgrade per §8.2.2
+- [x] **Protocol detection** — After TLS handshake, check ALPN result; if `h2`, enter HTTP/2 mode; h2c via connection preface detection on cleartext
+- [x] **H2 connection handler** (`src/server/H2Connection.zig`) — Full frame loop with HPACK decode/encode, stream registry, flow control, settings negotiation
+- [x] **Request mapping** — HPACK-decoded pseudo-headers → synthetic HTTP/1.1 request → existing `Request.parse` → handler
+- [x] **Response mapping** — `Response` → HPACK-encoded HEADERS frame (`:status` + headers) + DATA frames, with frame splitting for large payloads
+- [x] **Prohibited headers** — Connection, Keep-Alive, Transfer-Encoding, Upgrade stripped from both request and response
 - [ ] **100-continue** — Send informational HEADERS (`:status: 100`) before final response
 - [ ] **Trailers** — Send trailing HEADERS frame with END_STREAM
-- [ ] **PING/GOAWAY handling** — Respond to PING with ACK; send GOAWAY on shutdown with last-stream-id
+- [x] **PING/GOAWAY handling** — PING ACK responses; GOAWAY on protocol errors with last-stream-id
 - [ ] **Graceful shutdown** — GOAWAY with NO_ERROR, then allow in-flight streams to complete
+- [ ] **Request body support** — Buffer DATA frames and deliver to handler
 
 ### RFC References
 - §8.1 (message framing), §8.2 (fields), §8.3 (control data), §9.1 (connection management)

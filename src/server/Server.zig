@@ -9,6 +9,8 @@ const Headers = @import("../Headers.zig");
 const Date = @import("Date.zig");
 const Proxy = @import("Proxy.zig");
 const WebSocket = @import("WebSocket.zig");
+const H2Connection = @import("H2Connection.zig");
+const h2 = @import("../h2/root.zig");
 
 /// RFC 2616 Section 1.4: HTTP/1.1 server implementation.
 ///
@@ -208,6 +210,16 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     else
         &net_writer.interface;
 
+    // HTTP/2 via ALPN: if TLS negotiated "h2", handle as HTTP/2
+    if (tls_conn) |tc| {
+        if (tc.alpn_protocol) |proto| {
+            if (std.mem.eql(u8, proto, "h2")) {
+                H2Connection.serve(reader, writer, self.handler, io);
+                return;
+            }
+        }
+    }
+
     // Detect TLS ClientHello on a non-TLS port. The first byte of a TLS
     // record is 0x16 (handshake). Send a plain HTTP 400 and close.
     if (self.config.tls_config == null) {
@@ -225,6 +237,20 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             ) catch {};
             net_writer.interface.flush() catch {};
             return;
+        }
+    }
+
+    // HTTP/2 via prior knowledge (h2c): detect the connection preface
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" on cleartext connections.
+    if (self.config.tls_config == null) {
+        const peek = reader.peek(h2.connection_preface.len) catch null;
+        if (peek) |data| {
+            if (data.len >= h2.connection_preface.len and
+                std.mem.eql(u8, data[0..h2.connection_preface.len], h2.connection_preface))
+            {
+                H2Connection.serve(reader, writer, self.handler, io);
+                return;
+            }
         }
     }
 

@@ -153,7 +153,7 @@ pub const DynamicTable = struct {
     /// Write position in buffer.
     buf_pos: usize = 0,
 
-    const Entry = struct {
+    pub const Entry = struct {
         offset: u32,
         name_len: u16,
         value_len: u16,
