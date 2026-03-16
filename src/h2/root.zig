@@ -1,6 +1,7 @@
 pub const frame = @import("frame.zig");
 pub const errors = @import("errors.zig");
 pub const hpack = @import("hpack.zig");
+pub const huffman = @import("huffman.zig");
 pub const Stream = @import("Stream.zig");
 pub const StreamRegistry = @import("StreamRegistry.zig");
 pub const FlowControl = @import("FlowControl.zig");
@@ -23,6 +24,7 @@ test {
     _ = frame;
     _ = errors;
     _ = hpack;
+    _ = huffman;
     _ = Stream;
     _ = StreamRegistry;
     _ = FlowControl;

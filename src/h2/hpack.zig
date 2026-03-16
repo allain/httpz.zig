@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const huffman = @import("huffman.zig");
 
 /// HPACK: Header Compression for HTTP/2 (RFC 7541)
 ///
@@ -355,26 +356,40 @@ pub const Decoder = struct {
 
 /// Decode an HPACK string (RFC 7541 §5.2).
 /// Huffman encoding is indicated by the high bit of the first byte.
+/// When Huffman-encoded, decodes into `huffman_decode_buf` and returns
+/// a slice into that buffer.
 fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize } {
     if (data.len == 0) return error.HpackDecodingError;
 
-    const huffman = data[0] & 0x80 != 0;
+    const is_huffman = data[0] & 0x80 != 0;
     const result = try decodeInt(data, 7);
     const str_start = result.consumed;
     const str_len = result.value;
 
     if (str_start + str_len > data.len) return error.HpackDecodingError;
 
-    if (huffman) {
-        // TODO: Implement Huffman decoding. For now, return error.
-        return error.HpackHuffmanNotImplemented;
+    const encoded = data[str_start..][0..str_len];
+
+    if (is_huffman) {
+        // Decode Huffman into thread-local scratch buffer.
+        // The decoded output is at most 2x the encoded length for typical HTTP headers.
+        const dec_len = huffman.decode(&huffman_decode_scratch, encoded) catch
+            return error.HpackDecodingError;
+        return .{
+            .value = huffman_decode_scratch[0..dec_len],
+            .consumed = str_start + str_len,
+        };
     }
 
     return .{
-        .value = data[str_start..][0..str_len],
+        .value = encoded,
         .consumed = str_start + str_len,
     };
 }
+
+/// Scratch buffer for Huffman decoding. Decoded strings in HTTP headers
+/// are typically short (< 4KB).
+var huffman_decode_scratch: [8192]u8 = undefined;
 
 // --- Encoder ---
 
