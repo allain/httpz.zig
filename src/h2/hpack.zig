@@ -284,6 +284,9 @@ pub const Decoder = struct {
     /// Decode a complete header block fragment into header fields.
     /// Returns the number of headers decoded.
     pub fn decode(self: *Decoder, data: []const u8, headers: []HeaderField) !usize {
+        // Reset Huffman scratch buffer for this header block
+        huffman_scratch_offset = 0;
+
         var pos: usize = 0;
         var count: usize = 0;
 
@@ -356,8 +359,8 @@ pub const Decoder = struct {
 
 /// Decode an HPACK string (RFC 7541 §5.2).
 /// Huffman encoding is indicated by the high bit of the first byte.
-/// When Huffman-encoded, decodes into `huffman_decode_buf` and returns
-/// a slice into that buffer.
+/// When Huffman-encoded, decodes into the scratch buffer at the current
+/// offset so multiple decoded strings don't overwrite each other.
 fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize } {
     if (data.len == 0) return error.HpackDecodingError;
 
@@ -371,12 +374,15 @@ fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize }
     const encoded = data[str_start..][0..str_len];
 
     if (is_huffman) {
-        // Decode Huffman into thread-local scratch buffer.
-        // The decoded output is at most 2x the encoded length for typical HTTP headers.
-        const dec_len = huffman.decode(&huffman_decode_scratch, encoded) catch
+        if (huffman_scratch_offset >= huffman_decode_scratch.len)
             return error.HpackDecodingError;
+        const remaining = huffman_decode_scratch[huffman_scratch_offset..];
+        const dec_len = huffman.decode(remaining, encoded) catch
+            return error.HpackDecodingError;
+        const value = remaining[0..dec_len];
+        huffman_scratch_offset += dec_len;
         return .{
-            .value = huffman_decode_scratch[0..dec_len],
+            .value = value,
             .consumed = str_start + str_len,
         };
     }
@@ -387,9 +393,10 @@ fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize }
     };
 }
 
-/// Scratch buffer for Huffman decoding. Decoded strings in HTTP headers
-/// are typically short (< 4KB).
-var huffman_decode_scratch: [8192]u8 = undefined;
+/// Scratch buffer for Huffman decoding. Each decoded string occupies
+/// a separate region so slices remain valid for the header block.
+var huffman_decode_scratch: [16384]u8 = undefined;
+var huffman_scratch_offset: usize = 0;
 
 // --- Encoder ---
 

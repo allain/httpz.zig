@@ -326,33 +326,35 @@ pub fn encodedLength(src: []const u8) usize {
 /// `src` is the encoded data, `dst` receives the decoded bytes.
 /// Returns the number of bytes decoded.
 ///
-/// Uses a bit-by-bit tree walk approach similar to the BitReader
+/// Uses a bit-by-bit accumulator approach similar to the BitReader
 /// pattern from Maartz/huffman_encoding, but against the fixed
-/// HPACK Huffman table instead of a dynamic tree.
+/// HPACK Huffman table. Matches are found by trying code lengths
+/// from shortest (5) to longest (30), ensuring the correct
+/// prefix-free match.
 pub fn decode(dst: []u8, src: []const u8) !usize {
     var dst_pos: usize = 0;
-    var bits: u32 = 0;
-    var bits_left: u6 = 0;
+    var accumulator: u64 = 0;
+    var bits_left: u7 = 0;
 
     for (src) |byte| {
-        bits = (bits << 8) | byte;
+        accumulator = (accumulator << 8) | byte;
         bits_left += 8;
 
-        while (bits_left >= 5) { // shortest code is 5 bits
-            // Try to match codes from shortest to longest
+        while (bits_left >= 5) {
+            // Try matching from shortest to longest code length.
+            // Huffman codes are prefix-free, so the first match by
+            // length is the correct one.
             var found = false;
-            // Check all 256 symbols (not EOS)
             for (huffman_table[0..256], 0..) |code, sym| {
                 if (code.len <= bits_left) {
-                    const shift: u5 = @intCast(bits_left - code.len);
-                    const candidate = bits >> shift;
-                    const mask = (@as(u32, 1) << @intCast(code.len)) - 1;
-                    if (candidate & mask == code.bits) {
+                    const shift: u7 = bits_left - code.len;
+                    const candidate: u32 = @intCast((accumulator >> @intCast(shift)) & ((@as(u64, 1) << @intCast(code.len)) - 1));
+                    if (candidate == code.bits) {
                         if (dst_pos >= dst.len) return error.HpackDecodingError;
                         dst[dst_pos] = @intCast(sym);
                         dst_pos += 1;
                         bits_left -= code.len;
-                        bits &= (@as(u32, 1) << @intCast(bits_left)) - 1;
+                        accumulator &= (@as(u64, 1) << @intCast(bits_left)) - 1;
                         found = true;
                         break;
                     }
@@ -365,8 +367,8 @@ pub fn decode(dst: []u8, src: []const u8) !usize {
     // Remaining bits should be padding (all 1s) of at most 7 bits
     if (bits_left > 7) return error.HpackDecodingError;
     if (bits_left > 0) {
-        const mask = (@as(u32, 1) << @intCast(bits_left)) - 1;
-        if (bits & mask != mask) return error.HpackDecodingError;
+        const mask = (@as(u64, 1) << @intCast(bits_left)) - 1;
+        if (accumulator & mask != mask) return error.HpackDecodingError;
     }
 
     return dst_pos;

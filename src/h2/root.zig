@@ -25,6 +25,7 @@ test {
     _ = errors;
     _ = hpack;
     _ = huffman;
+    _ = @import("hpack_test.zig");
     _ = Stream;
     _ = StreamRegistry;
     _ = FlowControl;

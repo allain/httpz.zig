@@ -57,7 +57,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
   - Integer decoding with prefix-based variable-length encoding
 - [x] **Encoder** — Compress headers using static table lookups + dynamic table insertion; respect `SETTINGS_HEADER_TABLE_SIZE` from peer; emit Dynamic Table Size Update when table size changes
 - [x] **Huffman coding** (`src/h2/huffman.zig`) — RFC 7541 Appendix B static Huffman table; encode with 1-bit padding; decode with bit-level tree walk
-- [ ] **Tests** — RFC 7541 examples (§C.2–C.6 with Huffman) as test vectors
+- [x] **Tests** — RFC 7541 §C.2 (literal representations), §C.3 (requests without Huffman), §C.4 (requests with Huffman), plus Huffman encode verification against RFC byte sequences
 
 ### RFC References
 - §4.3 (field section compression), §4.3.1 (compression state)
