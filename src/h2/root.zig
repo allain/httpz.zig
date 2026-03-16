@@ -1,6 +1,8 @@
 pub const frame = @import("frame.zig");
 pub const errors = @import("errors.zig");
 pub const hpack = @import("hpack.zig");
+pub const Stream = @import("Stream.zig");
+pub const StreamRegistry = @import("StreamRegistry.zig");
 
 pub const FrameType = frame.FrameType;
 pub const FrameHeader = frame.FrameHeader;
@@ -19,4 +21,6 @@ test {
     _ = frame;
     _ = errors;
     _ = hpack;
+    _ = Stream;
+    _ = StreamRegistry;
 }
