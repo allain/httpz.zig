@@ -1,0 +1,212 @@
+# HTTP/2 Development Plan for httpz (RFC 9113)
+
+## Current State
+
+- Fully RFC 2616-compliant HTTP/1.1 server and client
+- TLS 1.3 via `tls.zig` dependency (no ALPN support yet)
+- Binary framing, multiplexing, HPACK — all unimplemented
+- Branch `http2` exists but is clean (no work started)
+
+---
+
+## Phase 0: ALPN Negotiation in tls.zig
+**Prerequisite — unblocks everything else**
+
+The `tls.zig` dependency defines the ALPN extension type (16) but has zero implementation. Without ALPN, clients and servers cannot negotiate `h2`.
+
+### Tasks
+- [x] **Client ALPN** — Add `alpn_protocols: []const []const u8` to client `Options`; write the ALPN extension in `makeClientHello`; parse the server's selected protocol from ServerHello/EncryptedExtensions
+- [x] **Server ALPN** — Parse the client's ALPN list in `readClientHello`; select a protocol (server preference order); write the selected protocol in EncryptedExtensions
+- [x] **Expose negotiated protocol** — Store `alpn_protocol` on `Connection` struct; propagate from handshake through `root.zig` client/server functions and NonBlock API
+- [ ] **Tests** — Client/server ALPN round-trip; fallback when no common protocol
+
+### RFC References
+- RFC 9113 §3.2 (ALPN required for `h2` over TLS)
+- RFC 7301 (ALPN extension format)
+
+---
+
+## Phase 1: Binary Framing Layer
+**The foundation everything else builds on**
+
+### Tasks
+- [x] **Frame types and constants** (`src/h2/frame.zig`)
+  - 9-byte frame header: Length(24) + Type(8) + Flags(8) + Reserved(1) + StreamID(31)
+  - All 10 frame types: DATA(0x0), HEADERS(0x1), PRIORITY(0x2), RST_STREAM(0x3), SETTINGS(0x4), PUSH_PROMISE(0x5), PING(0x6), GOAWAY(0x7), WINDOW_UPDATE(0x8), CONTINUATION(0x9)
+  - Flag constants: END_STREAM(0x1), END_HEADERS(0x4), PADDED(0x8), PRIORITY(0x20), ACK(0x1)
+- [x] **Frame reader** — Parse frame header from `std.Io`, validate length against `SETTINGS_MAX_FRAME_SIZE` (default 16,384; max 16,777,215), dispatch by type
+- [x] **Frame writer** — Serialize frame header + payload; convenience writers for SETTINGS, SETTINGS ACK, GOAWAY, WINDOW_UPDATE, RST_STREAM, PING
+- [x] **Error codes** (`src/h2/errors.zig`) — All 14 codes: NO_ERROR(0x0) through HTTP_1_1_REQUIRED(0xD); ConnectionError and StreamError types
+- [x] **Connection preface handling** — `connection_preface` constant defined; preface detection to be wired in Phase 6
+
+### RFC References
+- §4.1 (frame format), §4.2 (frame size), §7 (error codes), §3.4 (connection preface)
+
+---
+
+## Phase 2: HPACK Header Compression
+**Mandatory for HTTP/2 — headers cannot be sent uncompressed**
+
+### Tasks
+- [x] **Static table** (`src/h2/hpack.zig`) — The 61-entry predefined table from RFC 7541 Appendix A
+- [x] **Dynamic table** — Ring buffer with FIFO eviction, configurable max size (default 4,096 bytes via `SETTINGS_HEADER_TABLE_SIZE`)
+- [x] **Decoder** — Handle all 3 representation types:
+  - Indexed header field (prefix 1, 7-bit index)
+  - Literal with incremental indexing (prefix 01, 6-bit)
+  - Literal without indexing / never indexed (prefix 0000/0001, 4-bit)
+  - Integer decoding with prefix-based variable-length encoding
+- [x] **Encoder** — Compress headers using static table lookups + dynamic table insertion; respect `SETTINGS_HEADER_TABLE_SIZE` from peer; emit Dynamic Table Size Update when table size changes
+- [ ] **Huffman coding** — Huffman encode/decode for string literals (currently returns error)
+- [ ] **Tests** — RFC 7541 examples (§C.2–C.6 with Huffman) as test vectors
+
+### RFC References
+- §4.3 (field section compression), §4.3.1 (compression state)
+- RFC 7541 (HPACK specification)
+
+---
+
+## Phase 3: Stream Multiplexing & State Machine
+**The core of HTTP/2**
+
+### Tasks
+- [ ] **Stream state machine** (`src/h2/Stream.zig`) — 7 states: idle → open → half-closed(local/remote) → closed, plus reserved(local/remote); transitions triggered by HEADERS, END_STREAM, RST_STREAM, PUSH_PROMISE; validate frame receipt against current state
+- [ ] **Stream registry** (`src/h2/StreamRegistry.zig`) — Track active streams by ID (client=odd, server=even); enforce `SETTINGS_MAX_CONCURRENT_STREAMS`; monotonically increasing IDs; implicit closure of lower-numbered idle streams
+- [ ] **Stream-level I/O** — Demultiplex incoming frames to correct stream; multiplex outgoing frames from concurrent streams; handle CONTINUATION frame sequences (no interleaving allowed)
+
+### RFC References
+- §5.1 (stream states), §5.1.1 (stream identifiers), §5.1.2 (concurrency limits)
+
+---
+
+## Phase 4: Flow Control
+**Prevents fast senders from overwhelming receivers**
+
+### Tasks
+- [ ] **Window tracking** — Per-stream and connection-level windows, initial size 65,535 bytes
+- [ ] **WINDOW_UPDATE sending** — Receiver replenishes windows after consuming DATA frames
+- [ ] **WINDOW_UPDATE receiving** — Sender tracks available window; block DATA sends when window exhausted
+- [ ] **SETTINGS_INITIAL_WINDOW_SIZE** — Apply to new streams; adjust existing streams on settings change
+- [ ] **Overflow protection** — Window > 2^31-1 = FLOW_CONTROL_ERROR; increment of 0 = FLOW_CONTROL_ERROR
+
+### RFC References
+- §5.2 (flow control), §6.9 (WINDOW_UPDATE), §6.9.1–6.9.3 (window mechanics)
+
+---
+
+## Phase 5: SETTINGS Negotiation
+**Connection-level parameter exchange**
+
+### Tasks
+- [ ] **SETTINGS frame processing** — Parse/emit 6-byte identifier+value pairs on stream 0
+- [ ] **All 6 defined settings**:
+  | ID | Setting | Default |
+  |---|---|---|
+  | 0x1 | HEADER_TABLE_SIZE | 4,096 |
+  | 0x2 | ENABLE_PUSH | 1 |
+  | 0x3 | MAX_CONCURRENT_STREAMS | unlimited |
+  | 0x4 | INITIAL_WINDOW_SIZE | 65,535 |
+  | 0x5 | MAX_FRAME_SIZE | 16,384 |
+  | 0x6 | MAX_HEADER_LIST_SIZE | unlimited |
+- [ ] **ACK mechanism** — Respond to peer SETTINGS with ACK (empty SETTINGS + ACK flag); settings take effect immediately on receipt; HPACK table size changes take effect on ACK
+- [ ] **Unknown settings** — MUST be ignored (forward compatibility)
+
+### RFC References
+- §6.5 (SETTINGS), §6.5.2 (defined settings), §6.5.3 (synchronization)
+
+---
+
+## Phase 6: Server-Side HTTP/2
+**Integrate with existing httpz server**
+
+### Tasks
+- [ ] **Protocol detection** — After TLS handshake, check ALPN result; if `h2`, enter HTTP/2 mode; if prior knowledge (cleartext), detect connection preface
+- [ ] **H2 connection handler** (`src/server/H2Connection.zig`) — Replace `Connection.zig` for HTTP/2: read frames in a loop, dispatch to stream handlers
+- [ ] **Request mapping** — Convert HEADERS frames with pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`) into existing `Request` struct
+- [ ] **Response mapping** — Convert `Response` struct into HEADERS frame (`:status` pseudo-header + response headers) + DATA frames (body), respecting flow control windows
+- [ ] **Prohibited headers** — Strip/reject Connection, Keep-Alive, Transfer-Encoding, Upgrade per §8.2.2
+- [ ] **100-continue** — Send informational HEADERS (`:status: 100`) before final response
+- [ ] **Trailers** — Send trailing HEADERS frame with END_STREAM
+- [ ] **PING/GOAWAY handling** — Respond to PING with ACK; send GOAWAY on shutdown with last-stream-id
+- [ ] **Graceful shutdown** — GOAWAY with NO_ERROR, then allow in-flight streams to complete
+
+### RFC References
+- §8.1 (message framing), §8.2 (fields), §8.3 (control data), §9.1 (connection management)
+
+---
+
+## Phase 7: Client-Side HTTP/2
+**Extend the existing httpz client**
+
+### Tasks
+- [ ] **ALPN negotiation** — Request `h2` during TLS handshake; fall back to HTTP/1.1
+- [ ] **Connection preface** — Send the 24-byte magic + initial SETTINGS
+- [ ] **Request sending** — Convert client request into HEADERS + DATA frames on a new odd-numbered stream
+- [ ] **Response receiving** — Reassemble HEADERS + DATA into a response; handle informational (1xx) responses
+- [ ] **Stream multiplexing** — Support multiple concurrent requests on a single connection (connection pooling)
+- [ ] **Prior knowledge mode** — Support cleartext HTTP/2 (h2c) when configured
+
+### RFC References
+- §3.2 (starting h2 over TLS), §3.3 (prior knowledge), §8.3.1 (request pseudo-headers)
+
+---
+
+## Phase 8: Connection Management & Hardening
+**Production readiness**
+
+### Tasks
+- [ ] **Connection reuse** — Pool HTTP/2 connections by origin; reuse for multiple requests
+- [ ] **GOAWAY handling** — Drain in-flight streams; retry unprocessed requests on new connection
+- [ ] **RST_STREAM** — Handle stream cancellation gracefully; don't send RST in response to RST
+- [ ] **Idle stream cleanup** — Close streams that have been idle too long
+- [ ] **Settings timeout** — Detect peers that don't ACK settings in time (SETTINGS_TIMEOUT error)
+- [ ] **DoS protection** — Limit concurrent streams, header list size, and rapid stream creation (ENHANCE_YOUR_CALM)
+- [ ] **CONNECT method** — Tunnel support via §8.5
+
+### RFC References
+- §5.4 (error handling), §9.1.1 (connection reuse), §10.5 (DoS considerations)
+
+---
+
+## Phase 9: Server Push (Optional)
+**Low priority — many clients disable it, and it's being deprecated in practice**
+
+### Tasks
+- [ ] **PUSH_PROMISE** — Server sends on an existing client stream; reserves an even-numbered promised stream
+- [ ] **Promised response** — Send HEADERS + DATA on the promised stream
+- [ ] **Client handling** — Accept or RST_STREAM(CANCEL) pushed streams
+- [ ] **SETTINGS_ENABLE_PUSH** — Respect client's preference (0 = disabled)
+
+### RFC References
+- §8.4 (server push), §6.6 (PUSH_PROMISE frame)
+
+---
+
+## File Structure
+
+```
+src/
+├── h2/
+│   ├── frame.zig           # Frame types, parsing, serialization (Phase 1)
+│   ├── hpack.zig           # HPACK encoder/decoder + tables (Phase 2)
+│   ├── Stream.zig          # Stream state machine (Phase 3)
+│   ├── StreamRegistry.zig  # Stream tracking & concurrency (Phase 3)
+│   ├── FlowControl.zig     # Window management (Phase 4)
+│   ├── Settings.zig        # Settings negotiation (Phase 5)
+│   └── errors.zig          # Error codes (Phase 1)
+├── server/
+│   ├── H2Connection.zig    # HTTP/2 server connection handler (Phase 6)
+│   └── Server.zig          # Modified: protocol detection branch (Phase 6)
+├── client/
+│   └── Client.zig          # Modified: ALPN + h2 request path (Phase 7)
+└── root.zig                # Modified: export h2 types (Phase 1+)
+```
+
+---
+
+## Key Risks & Considerations
+
+- **tls.zig is a vendored dependency** — ALPN changes (Phase 0) need to be upstreamed or maintained as a fork
+- **HPACK is complex** — Use RFC 7541 test vectors extensively; compression bugs corrupt the entire connection
+- **Multiplexing changes the concurrency model** — HTTP/1.1 is one-request-per-connection; HTTP/2 needs concurrent stream handling within a single connection
+- **Priority signaling is deprecated** — Implement PRIORITY frame parsing for interop but don't invest in complex scheduling (§5.3.2)
+- **Server Push is falling out of favor** — Chrome removed support; Phase 9 is truly optional

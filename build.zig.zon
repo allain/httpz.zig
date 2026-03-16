@@ -33,8 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .tls = .{
-            .url = "https://github.com/allain/tls.zig/archive/refs/heads/updates.tar.gz",
-            .hash = "tls-0.1.0-ER2e0kl9BQCJwr06_gXxOYbs9Kgbwgff70QXReVhAGJk",
+            .path = "../tls.zig",
         },
     },
     // Specifies the set of files and directories that are included in this package.

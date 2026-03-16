@@ -21,6 +21,7 @@ pub const middleware = struct {
     pub const compression = @import("middleware/compression.zig");
     pub const cors = @import("middleware/cors.zig");
 };
+pub const h2 = @import("h2/root.zig");
 
 const std = @import("std");
 
