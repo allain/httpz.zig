@@ -151,7 +151,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **GOAWAY handling** — Server sends deferred GOAWAY on exit; client breaks response loop on GOAWAY; `StreamRegistry.goaway()` closes affected streams
 - [x] **RST_STREAM** — Server and client handle RST_STREAM by updating stream state; neither sends RST in response to RST (RFC 9113 §5.4.2)
 - [x] **Idle stream cleanup** — `StreamRegistry.gc()` runs periodically when stream count exceeds threshold
-- [ ] **Settings timeout** — Detect peers that don't ACK settings in time (SETTINGS_TIMEOUT error)
+- [x] **Settings timeout** — `Settings.Sync.frameReceived()` counts frames since SETTINGS was sent; GOAWAY with SETTINGS_TIMEOUT after 1000 frames without ACK
 - [x] **DoS protection** — Concurrent streams limited by `max_concurrent_streams`; header list size validated against 8KB limit; rapid reset detection with ENHANCE_YOUR_CALM after 100 RST_STREAMs per GC cycle
 - [ ] **CONNECT method** — Tunnel support via §8.5
 

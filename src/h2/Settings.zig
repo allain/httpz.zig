@@ -120,12 +120,20 @@ pub const Sync = struct {
     pending_encoder_table_size: ?u32 = null,
     /// Whether we have sent SETTINGS that haven't been ACKed yet.
     awaiting_ack: bool = false,
+    /// Number of frames received since we sent SETTINGS.
+    /// Used for timeout detection — if this exceeds the threshold
+    /// without an ACK, the peer is misbehaving (SETTINGS_TIMEOUT).
+    frames_since_sent: u32 = 0,
+
+    /// Maximum frames to wait for a SETTINGS ACK before considering it timed out.
+    const settings_ack_frame_limit: u32 = 1000;
 
     /// Record that we sent our local settings to the peer.
     /// If header_table_size differs from the current encoder size,
     /// the change is deferred until receiveAck().
     pub fn markSent(self: *Sync, encoder_current_size: u32) void {
         self.awaiting_ack = true;
+        self.frames_since_sent = 0;
         if (self.local.header_table_size != encoder_current_size) {
             self.pending_encoder_table_size = self.local.header_table_size;
         }
@@ -140,6 +148,17 @@ pub const Sync = struct {
             return size;
         }
         return null;
+    }
+
+    /// Record that a frame was received. Call this on every incoming frame.
+    /// Returns error.SettingsTimeout if ACK is overdue.
+    pub fn frameReceived(self: *Sync) !void {
+        if (self.awaiting_ack) {
+            self.frames_since_sent += 1;
+            if (self.frames_since_sent > settings_ack_frame_limit) {
+                return error.SettingsTimeout;
+            }
+        }
     }
 
     /// Apply received peer SETTINGS.

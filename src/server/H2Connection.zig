@@ -126,6 +126,12 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
             },
         };
 
+        // Settings timeout detection (RFC 9113 §6.5.3)
+        settings_sync.frameReceived() catch {
+            sendGoaway(writer, last_client_stream_id, .settings_timeout) catch {};
+            return;
+        };
+
         // If we're assembling a header block, only CONTINUATION on the same
         // stream is allowed (RFC 9113 §4.3)
         if (header_block_len > 0) {
