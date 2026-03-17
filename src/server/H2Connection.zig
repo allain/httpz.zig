@@ -549,19 +549,29 @@ fn processRequestImpl(
     }
 
     // Validate required pseudo-headers
-    if (method == null or path == null or scheme == null) {
-        try frame.writeRstStream(writer, stream_id, .protocol_error);
-        try writer.flush();
-        return;
+    // RFC 9113 §8.5: CONNECT uses only :method and :authority (no :scheme or :path)
+    const is_connect = method != null and mem.eql(u8, method.?, "CONNECT");
+    if (is_connect) {
+        if (authority == null or scheme != null or path != null) {
+            try frame.writeRstStream(writer, stream_id, .protocol_error);
+            try writer.flush();
+            return;
+        }
+    } else {
+        if (method == null or path == null or scheme == null) {
+            try frame.writeRstStream(writer, stream_id, .protocol_error);
+            try writer.flush();
+            return;
+        }
     }
 
     // Build a synthetic HTTP/1.1 request line + headers for the existing handler
     var request_buf: [8192]u8 = undefined;
     var pos: usize = 0;
 
-    // Request line: "GET /path HTTP/1.1\r\n"
     const m = method.?;
-    const p = path.?;
+    // CONNECT: "CONNECT host:port HTTP/1.1\r\n", others: "GET /path HTTP/1.1\r\n"
+    const p = if (is_connect) authority.? else path.?;
     @memcpy(request_buf[pos..][0..m.len], m);
     pos += m.len;
     request_buf[pos] = ' ';

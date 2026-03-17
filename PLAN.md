@@ -153,7 +153,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Idle stream cleanup** — `StreamRegistry.gc()` runs periodically when stream count exceeds threshold
 - [x] **Settings timeout** — `Settings.Sync.frameReceived()` counts frames since SETTINGS was sent; GOAWAY with SETTINGS_TIMEOUT after 1000 frames without ACK
 - [x] **DoS protection** — Concurrent streams limited by `max_concurrent_streams`; header list size validated against 8KB limit; rapid reset detection with ENHANCE_YOUR_CALM after 100 RST_STREAMs per GC cycle
-- [ ] **CONNECT method** — Tunnel support via §8.5
+- [x] **CONNECT method** — Validates CONNECT pseudo-headers (only `:method` + `:authority`, no `:scheme`/`:path`); passes through to handler as `CONNECT host:port HTTP/1.1`
 
 ### RFC References
 - §5.4 (error handling), §9.1.1 (connection reuse), §10.5 (DoS considerations)
@@ -166,8 +166,8 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 ### Tasks
 - [ ] **PUSH_PROMISE** — Server sends on an existing client stream; reserves an even-numbered promised stream
 - [ ] **Promised response** — Send HEADERS + DATA on the promised stream
-- [ ] **Client handling** — Accept or RST_STREAM(CANCEL) pushed streams
-- [ ] **SETTINGS_ENABLE_PUSH** — Respect client's preference (0 = disabled)
+- [x] **Client handling** — Client sends `SETTINGS_ENABLE_PUSH=0`; server rejects PUSH_PROMISE from clients as protocol error
+- [x] **SETTINGS_ENABLE_PUSH** — H2Client disables push in initial SETTINGS; server checks `peer.enable_push` before pushing (currently never pushes)
 
 ### RFC References
 - §8.4 (server push), §6.6 (PUSH_PROMISE frame)
