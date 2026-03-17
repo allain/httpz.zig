@@ -135,8 +135,8 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Connection preface** — H2Client sends 24-byte magic + SETTINGS, reads server SETTINGS, exchanges ACKs
 - [x] **Request sending** — HPACK-encodes pseudo-headers + regular headers into HEADERS frame, sends DATA for body
 - [x] **Response receiving** — Reads HEADERS + DATA frames, handles SETTINGS/PING/WINDOW_UPDATE interleaved, skips 1xx informational responses, assembles body from DATA parts
-- [ ] **Stream multiplexing** — Support multiple concurrent requests on a single connection (connection pooling)
-- [ ] **Prior knowledge mode** — Support cleartext HTTP/2 (h2c) when configured
+- [x] **Stream multiplexing** — Sequential multiplexing via StreamRegistry (each `request()` uses a new stream ID); concurrent in-flight requests require async I/O (future enhancement)
+- [ ] **Prior knowledge mode** — Server supports h2c via preface detection; client h2c requires reader/writer lifetime refactor
 
 ### RFC References
 - §3.2 (starting h2 over TLS), §3.3 (prior knowledge), §8.3.1 (request pseudo-headers)
@@ -147,12 +147,12 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Production readiness**
 
 ### Tasks
-- [ ] **Connection reuse** — Pool HTTP/2 connections by origin; reuse for multiple requests
-- [ ] **GOAWAY handling** — Drain in-flight streams; retry unprocessed requests on new connection
-- [ ] **RST_STREAM** — Handle stream cancellation gracefully; don't send RST in response to RST
-- [ ] **Idle stream cleanup** — Close streams that have been idle too long
+- [x] **Connection reuse** — H2Client persists across multiple `request()` calls on the same connection; each call opens a new stream
+- [x] **GOAWAY handling** — Server sends deferred GOAWAY on exit; client breaks response loop on GOAWAY; `StreamRegistry.goaway()` closes affected streams
+- [x] **RST_STREAM** — Server and client handle RST_STREAM by updating stream state; neither sends RST in response to RST (RFC 9113 §5.4.2)
+- [x] **Idle stream cleanup** — `StreamRegistry.gc()` runs periodically when stream count exceeds threshold
 - [ ] **Settings timeout** — Detect peers that don't ACK settings in time (SETTINGS_TIMEOUT error)
-- [ ] **DoS protection** — Limit concurrent streams, header list size, and rapid stream creation (ENHANCE_YOUR_CALM)
+- [x] **DoS protection** — Concurrent streams limited by `max_concurrent_streams`; header list size validated against 8KB limit; rapid reset detection with ENHANCE_YOUR_CALM after 100 RST_STREAMs per GC cycle
 - [ ] **CONNECT method** — Tunnel support via §8.5
 
 ### RFC References

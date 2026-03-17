@@ -112,6 +112,10 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
     // Graceful shutdown: send GOAWAY with NO_ERROR when we exit the frame loop
     defer sendGoaway(writer, last_client_stream_id, .no_error) catch {};
 
+    // DoS protection: rapid reset detection (RFC 9113 §10.5)
+    var rst_stream_count: u32 = 0;
+    const max_rst_stream_per_cycle: u32 = 100;
+
     // --- Frame loop ---
     while (true) {
         const f = readFrameFromReader(reader) catch |err| switch (err) {
@@ -398,6 +402,12 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                 if (registry.get(f.header.stream_id)) |s| {
                     s.recv(.rst_stream, Flags.none) catch {};
                 }
+                // DoS: rapid reset detection
+                rst_stream_count += 1;
+                if (rst_stream_count > max_rst_stream_per_cycle) {
+                    try sendGoaway(writer, last_client_stream_id, .enhance_your_calm);
+                    return;
+                }
             },
 
             .priority => {
@@ -419,9 +429,10 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
             },
         }
 
-        // Periodic GC of closed streams
+        // Periodic GC of closed streams and reset DoS counters
         if (registry.len > 64) {
             registry.gc();
+            rst_stream_count = 0;
         }
     }
 }
@@ -496,6 +507,20 @@ fn processRequestImpl(
         return;
     };
     const headers = decoded_headers[0..header_count];
+
+    // DoS: enforce header list size limit (RFC 9113 §10.5.1)
+    {
+        const max_header_list_size: usize = 8192; // matches our SETTINGS_MAX_HEADER_LIST_SIZE default
+        var total_header_size: usize = 0;
+        for (headers) |h| {
+            total_header_size += h.name.len + h.value.len + 32;
+        }
+        if (total_header_size > max_header_list_size) {
+            try frame.writeRstStream(writer, stream_id, .refused_stream);
+            try writer.flush();
+            return;
+        }
+    }
 
     // Extract pseudo-headers (RFC 9113 §8.3.1)
     var method: ?[]const u8 = null;

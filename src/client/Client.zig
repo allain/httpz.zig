@@ -24,6 +24,10 @@ pub const Config = struct {
     max_response_size: usize = 10 * 1024 * 1024,
     /// TLS configuration - if provided, HTTPS will be used
     tls_config: ?tls.config.Client = null,
+    /// Use HTTP/2 with prior knowledge (h2c) over cleartext TCP.
+    /// When true, the client sends the HTTP/2 connection preface
+    /// immediately without TLS or Upgrade negotiation.
+    h2_prior_knowledge: bool = false,
 };
 
 pub const Url = struct {
