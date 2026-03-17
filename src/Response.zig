@@ -136,6 +136,17 @@ stream_fn: ?*const fn (?*anyopaque, *std.Io.Writer) void = null,
 /// Optional opaque context pointer passed to stream_fn. Zig has no closures,
 /// so this lets handlers pass state (file handles, etc.) to their stream function.
 stream_context: ?*anyopaque = null,
+/// HTTP/2 trailer headers. When set, these are sent as a trailing HEADERS
+/// frame with END_STREAM after the response body DATA frames.
+/// In HTTP/1.1 chunked encoding, trailers are appended after the final chunk.
+trailers: ?Headers = null,
+
+/// HTTP/2 server push promises. Each entry is a path that the server
+/// will proactively push to the client. Only used in HTTP/2 connections
+/// when the client has not disabled push (SETTINGS_ENABLE_PUSH=1).
+/// Maximum 4 push promises per response.
+push_paths: [4]?[]const u8 = .{ null, null, null, null },
+push_count: u8 = 0,
 
 /// Embedded buffer for server-generated header values (Date, Via).
 /// Avoids threadlocal storage so header value slices have a well-defined
@@ -145,6 +156,14 @@ server_header_buf_len: usize = 0,
 
 /// 29 bytes for Date + 256 bytes for Via = 285, round up
 const max_server_header_buf = 300;
+
+/// Add an HTTP/2 server push promise path.
+pub fn addPush(self: *Response, path: []const u8) void {
+    if (self.push_count < 4) {
+        self.push_paths[self.push_count] = path;
+        self.push_count += 1;
+    }
+}
 
 /// Allocate space in the embedded buffer and return a slice.
 /// Returns null if the buffer is full.

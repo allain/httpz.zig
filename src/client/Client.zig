@@ -103,12 +103,17 @@ tls_output_buf: [tls.output_buffer_len]u8 = undefined,
 read_buf: []u8,
 write_buf: []u8,
 allocator: std.mem.Allocator,
-/// HTTP/2 client state — initialized when ALPN negotiates "h2".
+/// HTTP/2 client state — initialized when ALPN negotiates "h2" or h2c prior knowledge.
 h2_client: ?H2Client = null,
 tls_read_buf_h2: [8192]u8 = undefined,
 tls_write_buf_h2: [8192]u8 = undefined,
 tls_reader_h2: ?tls.Connection.Reader = null,
 tls_writer_h2: ?tls.Connection.Writer = null,
+/// Persistent net reader/writer for h2c (cleartext HTTP/2)
+h2c_net_reader: ?Io.net.Stream.Reader = null,
+h2c_net_writer: ?Io.net.Stream.Writer = null,
+h2c_read_buf: [8192]u8 = undefined,
+h2c_write_buf: [8192]u8 = undefined,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const buf_size = @max(config.read_buffer_size, config.write_buffer_size);
@@ -166,6 +171,17 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
         }
     } else {
         self.stream = stream;
+
+        // h2c prior knowledge: HTTP/2 over cleartext TCP
+        if (self.config.h2_prior_knowledge) {
+            self.h2c_net_reader = Io.net.Stream.Reader.init(stream, io, &self.h2c_read_buf);
+            self.h2c_net_writer = Io.net.Stream.Writer.init(stream, io, &self.h2c_write_buf);
+            self.h2_client = H2Client.init(&self.h2c_net_reader.?.interface, &self.h2c_net_writer.?.interface);
+            self.h2_client.?.handshake() catch {
+                self.h2_client = null;
+                return error.ConnectionFailed;
+            };
+        }
     }
 }
 

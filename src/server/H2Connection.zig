@@ -662,6 +662,90 @@ fn processRequestImpl(
     var response = Connection.processRequest(allocator, io, timestamp, &request, handler);
     defer response.deinit(allocator);
 
+    // --- HTTP/2 Server Push (RFC 9113 §8.4) ---
+    // Send PUSH_PROMISE for each path the handler wants to push,
+    // if the client hasn't disabled push.
+    if (response.push_count > 0 and peer_settings.enable_push) {
+        for (response.push_paths[0..response.push_count]) |maybe_push_path| {
+            const push_path = maybe_push_path orelse continue;
+            // Open a new server-initiated (even) stream for the push
+            const push_stream = registry.open() catch break;
+            const push_stream_id = push_stream.id;
+
+            // Encode PUSH_PROMISE header block: the promised request headers
+            var pp_hdr_buf: [1024]u8 = undefined;
+            var pp_pos: usize = 0;
+            // Promised Stream ID (4 bytes, first bit reserved)
+            pp_hdr_buf[0] = @intCast((push_stream_id >> 24) & 0x7F);
+            pp_hdr_buf[1] = @intCast((push_stream_id >> 16) & 0xFF);
+            pp_hdr_buf[2] = @intCast((push_stream_id >> 8) & 0xFF);
+            pp_hdr_buf[3] = @intCast(push_stream_id & 0xFF);
+            pp_pos = 4;
+            // Encode the promised request pseudo-headers
+            pp_pos += encoder.encodeHeader(pp_hdr_buf[pp_pos..], ":method", "GET") catch break;
+            pp_pos += encoder.encodeHeader(pp_hdr_buf[pp_pos..], ":path", push_path) catch break;
+            if (scheme) |s| {
+                pp_pos += encoder.encodeHeader(pp_hdr_buf[pp_pos..], ":scheme", s) catch break;
+            }
+            if (authority) |a| {
+                pp_pos += encoder.encodeHeader(pp_hdr_buf[pp_pos..], ":authority", a) catch break;
+            }
+
+            // Send PUSH_PROMISE on the original stream
+            frame.writeFrame(writer, .push_promise, .{ .value = Flags.end_headers }, stream_id, pp_hdr_buf[0..pp_pos]) catch break;
+            writer.flush() catch break;
+
+            // Now send the pushed response on the promised stream
+            // Build a synthetic GET request for the push path
+            var push_req_buf: [4096]u8 = undefined;
+            var prp: usize = 0;
+            @memcpy(push_req_buf[prp..][0..4], "GET ");
+            prp += 4;
+            @memcpy(push_req_buf[prp..][0..push_path.len], push_path);
+            prp += push_path.len;
+            @memcpy(push_req_buf[prp..][0..11], " HTTP/1.1\r\n");
+            prp += 11;
+            if (authority) |auth| {
+                @memcpy(push_req_buf[prp..][0..6], "Host: ");
+                prp += 6;
+                @memcpy(push_req_buf[prp..][0..auth.len], auth);
+                prp += auth.len;
+                @memcpy(push_req_buf[prp..][0..2], "\r\n");
+                prp += 2;
+            }
+            @memcpy(push_req_buf[prp..][0..2], "\r\n");
+            prp += 2;
+
+            const push_request = Request.parse(push_req_buf[0..prp]) catch break;
+            var push_response = Connection.processRequest(allocator, io, timestamp, &push_request, handler);
+
+            // Encode pushed response headers
+            var push_resp_buf: [4096]u8 = undefined;
+            var push_hpos: usize = 0;
+            var push_status_str: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&push_status_str, "{d}", .{push_response.status.toInt()}) catch break;
+            push_hpos += encoder.encodeHeader(push_resp_buf[push_hpos..], ":status", &push_status_str) catch break;
+            for (push_response.headers.entries[0..push_response.headers.len]) |entry| {
+                if (entry.name.len == 0) continue;
+                if (Headers.eqlIgnoreCase(entry.name, "connection")) continue;
+                if (Headers.eqlIgnoreCase(entry.name, "transfer-encoding")) continue;
+                if (push_hpos + entry.name.len + entry.value.len + 10 > push_resp_buf.len) break;
+                push_hpos += encoder.encodeHeader(push_resp_buf[push_hpos..], entry.name, entry.value) catch break;
+            }
+
+            const push_has_body = !push_response.strip_body and push_response.body.len > 0;
+            const push_hdr_flags: u8 = Flags.end_headers | if (!push_has_body) Flags.end_stream else 0;
+            frame.writeFrame(writer, .headers, .{ .value = push_hdr_flags }, push_stream_id, push_resp_buf[0..push_hpos]) catch break;
+            if (push_has_body) {
+                const fw = h2.ConnectionIO.FrameWriter{ .max_frame_size = @intCast(peer_settings.max_frame_size) };
+                fw.writeData(writer, push_stream_id, push_response.body, true) catch break;
+            }
+            writer.flush() catch break;
+
+            push_response.deinit(allocator);
+        }
+    }
+
     // --- Encode and send the HTTP/2 response ---
 
     // Encode response headers via HPACK
@@ -692,7 +776,9 @@ fn processRequestImpl(
     }
 
     const has_body = !response.strip_body and response.body.len > 0;
-    const header_flags: u8 = Flags.end_headers | if (!has_body) Flags.end_stream else 0;
+    const has_trailers = response.trailers != null and response.trailers.?.len > 0;
+    // END_STREAM goes on headers only if no body and no trailers
+    const header_flags: u8 = Flags.end_headers | if (!has_body and !has_trailers) Flags.end_stream else 0;
 
     // Send HEADERS frame(s) — split if exceeds max frame size
     const max_payload: usize = peer_settings.max_frame_size;
@@ -729,7 +815,7 @@ fn processRequestImpl(
                 // TODO: proper flow control backpressure
             }
 
-            const data_flags: Flags = if (is_last) .{ .value = Flags.end_stream } else Flags.none;
+            const data_flags: Flags = if (is_last and !has_trailers) .{ .value = Flags.end_stream } else Flags.none;
             try frame.writeFrame(writer, .data, data_flags, stream_id, body[sent..][0..chunk]);
 
             // Consume from flow control windows
@@ -742,12 +828,24 @@ fn processRequestImpl(
         }
     }
 
-    // Update stream state for sent response
-    if (has_body) {
-        stream.send(.data, .{ .value = Flags.end_stream }) catch {};
-    } else {
-        stream.send(.headers, .{ .value = Flags.end_stream }) catch {};
+    // Send trailing HEADERS with END_STREAM if trailers are present
+    if (has_trailers) {
+        var trailer_buf: [4096]u8 = undefined;
+        var tpos: usize = 0;
+        const trailers = response.trailers.?;
+        for (trailers.entries[0..trailers.len]) |entry| {
+            if (entry.name.len == 0) continue;
+            if (tpos + entry.name.len + entry.value.len + 10 > trailer_buf.len) break;
+            tpos += encoder.encodeHeader(trailer_buf[tpos..], entry.name, entry.value) catch break;
+        }
+        if (tpos > 0) {
+            const trailer_flags: u8 = Flags.end_headers | Flags.end_stream;
+            try frame.writeFrame(writer, .headers, .{ .value = trailer_flags }, stream_id, trailer_buf[0..tpos]);
+        }
     }
+
+    // Update stream state for sent response
+    stream.send(.headers, .{ .value = Flags.end_stream }) catch {};
 
     try writer.flush();
 }

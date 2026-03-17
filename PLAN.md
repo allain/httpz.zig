@@ -117,7 +117,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Response mapping** — `Response` → HPACK-encoded HEADERS frame (`:status` + headers) + DATA frames, with frame splitting for large payloads
 - [x] **Prohibited headers** — Connection, Keep-Alive, Transfer-Encoding, Upgrade stripped from both request and response
 - [x] **100-continue** — Sends informational `:status: 100` HEADERS when client sends `expect: 100-continue`
-- [ ] **Trailers** — Not yet supported (handler API has no trailer field; future enhancement)
+- [x] **Trailers** — `Response.trailers` field; server sends trailing HEADERS frame with END_STREAM after DATA; DATA frames omit END_STREAM when trailers present
 - [x] **PING/GOAWAY handling** — PING ACK responses; GOAWAY on protocol errors with last-stream-id
 - [x] **Graceful shutdown** — Deferred GOAWAY with NO_ERROR on clean frame loop exit
 - [x] **Request body support** — DATA frames buffered per-stream (up to 1 MiB); body included in synthetic request with Content-Length; handler receives full body
@@ -136,7 +136,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Request sending** — HPACK-encodes pseudo-headers + regular headers into HEADERS frame, sends DATA for body
 - [x] **Response receiving** — Reads HEADERS + DATA frames, handles SETTINGS/PING/WINDOW_UPDATE interleaved, skips 1xx informational responses, assembles body from DATA parts
 - [x] **Stream multiplexing** — Sequential multiplexing via StreamRegistry (each `request()` uses a new stream ID); concurrent in-flight requests require async I/O (future enhancement)
-- [ ] **Prior knowledge mode** — Server supports h2c via preface detection; client h2c requires reader/writer lifetime refactor
+- [x] **Prior knowledge mode** — Server detects h2c preface on cleartext; client uses `h2_prior_knowledge` config with persistent net reader/writer
 
 ### RFC References
 - §3.2 (starting h2 over TLS), §3.3 (prior knowledge), §8.3.1 (request pseudo-headers)
@@ -164,8 +164,8 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Low priority — many clients disable it, and it's being deprecated in practice**
 
 ### Tasks
-- [ ] **PUSH_PROMISE** — Server sends on an existing client stream; reserves an even-numbered promised stream
-- [ ] **Promised response** — Send HEADERS + DATA on the promised stream
+- [x] **PUSH_PROMISE** — Server sends PUSH_PROMISE with promised request headers on original client stream; reserves even-numbered stream via `registry.open()`
+- [x] **Promised response** — Builds synthetic GET request for push path, invokes handler, sends HEADERS + DATA on promised stream
 - [x] **Client handling** — Client sends `SETTINGS_ENABLE_PUSH=0`; server rejects PUSH_PROMISE from clients as protocol error
 - [x] **SETTINGS_ENABLE_PUSH** — H2Client disables push in initial SETTINGS; server checks `peer.enable_push` before pushing (currently never pushes)
 
