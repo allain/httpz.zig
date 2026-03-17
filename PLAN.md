@@ -18,7 +18,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Client ALPN** — Add `alpn_protocols: []const []const u8` to client `Options`; write the ALPN extension in `makeClientHello`; parse the server's selected protocol from ServerHello/EncryptedExtensions
 - [x] **Server ALPN** — Parse the client's ALPN list in `readClientHello`; select a protocol (server preference order); write the selected protocol in EncryptedExtensions
 - [x] **Expose negotiated protocol** — Store `alpn_protocol` on `Connection` struct; propagate from handshake through `root.zig` client/server functions and NonBlock API
-- [ ] **Tests** — Client/server ALPN round-trip; fallback when no common protocol
+- [x] **Tests** — h2 negotiation, server preference order, no-ALPN passthrough, no-common-protocol error
 
 ### RFC References
 - RFC 9113 §3.2 (ALPN required for `h2` over TLS)
