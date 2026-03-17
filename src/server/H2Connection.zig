@@ -47,16 +47,22 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
     }
 
     // Send our server preface: SETTINGS frame
-    var our_settings: Settings = .{};
-    our_settings.max_concurrent_streams = 100;
+    var settings_sync: Settings.Sync = .{};
+    settings_sync.local.max_concurrent_streams = 100;
     const settings_list = [_]frame.Setting{
         .{ .id = .max_concurrent_streams, .value = 100 },
     };
     try frame.writeSettings(writer, &settings_list);
     try writer.flush();
 
+    // HPACK encoder state — initialized before settings exchange
+    var hpack_enc_buf: [4096]u8 = undefined;
+    var hpack_enc_entries: [128]hpack.DynamicTable.Entry = undefined;
+    var encoder = hpack.Encoder.init(&hpack_enc_buf, &hpack_enc_entries);
+
+    settings_sync.markSent(@intCast(encoder.dynamic_table.max_size));
+
     // Read the client's SETTINGS frame (must be first frame after preface)
-    var peer_settings: Settings = .{};
     {
         const f = readFrameFromReader(reader) catch return;
         if (f.header.frame_type != .settings or f.header.flags.has(Flags.ack)) {
@@ -67,29 +73,25 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
             try sendGoaway(writer, 0, .protocol_error);
             return;
         }
-        _ = peer_settings.applyAll(f.payload) catch {
+        const result = settings_sync.applyPeerSettings(f.payload) catch {
             try sendGoaway(writer, 0, .protocol_error);
             return;
         };
+        _ = result;
     }
     // ACK the client's SETTINGS
     try frame.writeSettingsAck(writer);
     try writer.flush();
 
     // --- Connection state ---
-    var registry: StreamRegistry = .{ .is_server = true, .max_concurrent_streams = our_settings.max_concurrent_streams };
+    var registry: StreamRegistry = .{ .is_server = true, .max_concurrent_streams = settings_sync.local.max_concurrent_streams };
     var flow: FlowControl.FlowController = .{};
 
     // HPACK decoder state
     var hpack_dec_buf: [4096]u8 = undefined;
     var hpack_dec_entries: [128]hpack.DynamicTable.Entry = undefined;
     var decoder = hpack.Decoder.init(&hpack_dec_buf, &hpack_dec_entries);
-    decoder.dynamic_table.setMaxSize(peer_settings.header_table_size);
-
-    // HPACK encoder state
-    var hpack_enc_buf: [4096]u8 = undefined;
-    var hpack_enc_entries: [128]hpack.DynamicTable.Entry = undefined;
-    var encoder = hpack.Encoder.init(&hpack_enc_buf, &hpack_enc_entries);
+    decoder.dynamic_table.setMaxSize(settings_sync.peer.header_table_size);
 
     // Header block assembly buffer (for CONTINUATION frames)
     var header_block_buf: [16384]u8 = undefined;
@@ -126,23 +128,27 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                     return;
                 }
                 if (f.header.flags.has(Flags.ack)) {
-                    // ACK of our settings — nothing to do
+                    // ACK of our settings — apply deferred HPACK encoder table size
+                    if (settings_sync.receiveAck()) |new_table_size| {
+                        encoder.setMaxTableSize(new_table_size);
+                    }
                     continue;
                 }
-                const old_window = peer_settings.applyAll(f.payload) catch {
+                const result = settings_sync.applyPeerSettings(f.payload) catch {
                     try sendGoaway(writer, last_client_stream_id, .protocol_error);
                     return;
                 };
                 // Adjust stream windows if initial_window_size changed
-                if (peer_settings.initial_window_size != old_window) {
-                    const delta: i32 = @as(i32, @intCast(peer_settings.initial_window_size)) - @as(i32, @intCast(old_window));
+                if (settings_sync.peer.initial_window_size != result.old_window) {
+                    const delta: i32 = @as(i32, @intCast(settings_sync.peer.initial_window_size)) - @as(i32, @intCast(result.old_window));
                     for (registry.streams[0..registry.len]) |*s| {
                         if (s.isActive()) {
                             s.send_window +|= delta;
                         }
                     }
                 }
-                decoder.dynamic_table.setMaxSize(peer_settings.header_table_size);
+                // HPACK decoder table size takes effect immediately on receipt
+                decoder.dynamic_table.setMaxSize(result.new_decoder_table_size);
                 try frame.writeSettingsAck(writer);
                 try writer.flush();
             },
@@ -237,7 +243,7 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                         &decoder,
                         &encoder,
                         &flow,
-                        &peer_settings,
+                        &settings_sync.peer,
                         fragment,
                         f.header.stream_id,
                         f.header.flags.has(Flags.end_stream),
@@ -278,7 +284,7 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                         &decoder,
                         &encoder,
                         &flow,
-                        &peer_settings,
+                        &settings_sync.peer,
                         header_block_buf[0..header_block_len],
                         header_block_stream_id,
                         header_block_end_stream,

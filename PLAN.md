@@ -99,7 +99,7 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 ### Tasks
 - [x] **SETTINGS frame processing** — `Settings.applyAll` parses payload; `Settings.encode` emits non-default values
 - [x] **All 6 defined settings** — header_table_size, enable_push, max_concurrent_streams, initial_window_size, max_frame_size, max_header_list_size with validation
-- [ ] **ACK mechanism** — Respond to peer SETTINGS with ACK; HPACK table size changes take effect on ACK (wiring in Phase 6)
+- [x] **ACK mechanism** — `Settings.Sync` tracks pending HPACK encoder table size; defers change until peer ACKs; decoder table size applied immediately on receipt
 - [x] **Unknown settings** — Ignored per RFC 9113 §6.5.2
 
 ### RFC References

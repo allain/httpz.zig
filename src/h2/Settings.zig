@@ -105,6 +105,55 @@ pub fn encode(self: *const Settings, buf: []u8) !usize {
     return pos;
 }
 
+/// Tracks the settings synchronization lifecycle (RFC 9113 §6.5.3).
+///
+/// When we send SETTINGS to the peer, the new header_table_size must not
+/// be applied to the HPACK encoder until the peer ACKs. This struct
+/// queues the pending value and applies it on ACK.
+pub const Sync = struct {
+    /// Our local settings (what we advertise to the peer).
+    local: Settings = .{},
+    /// Peer's settings (what the peer advertises to us).
+    peer: Settings = .{},
+    /// Pending HPACK encoder table size, waiting for peer ACK.
+    /// null means no pending change.
+    pending_encoder_table_size: ?u32 = null,
+    /// Whether we have sent SETTINGS that haven't been ACKed yet.
+    awaiting_ack: bool = false,
+
+    /// Record that we sent our local settings to the peer.
+    /// If header_table_size differs from the current encoder size,
+    /// the change is deferred until receiveAck().
+    pub fn markSent(self: *Sync, encoder_current_size: u32) void {
+        self.awaiting_ack = true;
+        if (self.local.header_table_size != encoder_current_size) {
+            self.pending_encoder_table_size = self.local.header_table_size;
+        }
+    }
+
+    /// Process a received SETTINGS ACK from the peer.
+    /// Returns the new HPACK encoder table size if it changed, or null.
+    pub fn receiveAck(self: *Sync) ?u32 {
+        self.awaiting_ack = false;
+        if (self.pending_encoder_table_size) |size| {
+            self.pending_encoder_table_size = null;
+            return size;
+        }
+        return null;
+    }
+
+    /// Apply received peer SETTINGS.
+    /// Returns the old initial_window_size for stream window adjustment.
+    /// The HPACK decoder table size should be updated immediately.
+    pub fn applyPeerSettings(self: *Sync, payload: []const u8) !struct { old_window: u32, new_decoder_table_size: u32 } {
+        const old_window = try self.peer.applyAll(payload);
+        return .{
+            .old_window = old_window,
+            .new_decoder_table_size = self.peer.header_table_size,
+        };
+    }
+};
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -219,4 +268,44 @@ test "applyAll returns old window for delta computation" {
     try testing.expectEqual(@as(u32, 65535), old);
     try testing.expectEqual(@as(u32, 32768), s.initial_window_size);
     // Caller would compute delta = 32768 - 65535 = -32767 and adjust all stream windows
+}
+
+test "Sync: markSent and receiveAck with table size change" {
+    var sync: Sync = .{};
+    sync.local.header_table_size = 8192; // changed from default 4096
+
+    // Mark sent with current encoder size = 4096 (the default)
+    sync.markSent(4096);
+    try testing.expect(sync.awaiting_ack);
+    try testing.expectEqual(@as(?u32, 8192), sync.pending_encoder_table_size);
+
+    // Receive ACK — should return the new table size
+    const new_size = sync.receiveAck();
+    try testing.expectEqual(@as(?u32, 8192), new_size);
+    try testing.expect(!sync.awaiting_ack);
+    try testing.expectEqual(@as(?u32, null), sync.pending_encoder_table_size);
+}
+
+test "Sync: markSent with no table size change" {
+    var sync: Sync = .{};
+    // local.header_table_size == 4096 (default), encoder also at 4096
+    sync.markSent(4096);
+    try testing.expect(sync.awaiting_ack);
+    try testing.expectEqual(@as(?u32, null), sync.pending_encoder_table_size);
+
+    const new_size = sync.receiveAck();
+    try testing.expectEqual(@as(?u32, null), new_size);
+}
+
+test "Sync: applyPeerSettings" {
+    var sync: Sync = .{};
+
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 0x1, .big); // HEADER_TABLE_SIZE
+    std.mem.writeInt(u32, payload[2..6], 2048, .big);
+
+    const result = try sync.applyPeerSettings(&payload);
+    try testing.expectEqual(@as(u32, 65535), result.old_window);
+    try testing.expectEqual(@as(u32, 2048), result.new_decoder_table_size);
+    try testing.expectEqual(@as(u32, 2048), sync.peer.header_table_size);
 }
