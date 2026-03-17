@@ -99,8 +99,18 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
     var header_block_stream_id: u31 = 0;
     var header_block_end_stream: bool = false;
 
-    // Track last stream ID for GOAWAY
+    // Pending request state — when HEADERS arrives without END_STREAM,
+    // we store the decoded header block and wait for DATA + END_STREAM.
+    var pending_header_block: [16384]u8 = undefined;
+    var pending_header_block_len: usize = 0;
+    var pending_stream_id: u31 = 0;
+    var body_buf: [1_048_576]u8 = undefined; // 1 MiB max body
+    var body_len: usize = 0;
+
+    // Track last stream ID for GOAWAY (also used by deferred graceful shutdown)
     var last_client_stream_id: u31 = 0;
+    // Graceful shutdown: send GOAWAY with NO_ERROR when we exit the frame loop
+    defer sendGoaway(writer, last_client_stream_id, .no_error) catch {};
 
     // --- Frame loop ---
     while (true) {
@@ -236,21 +246,26 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                 const fragment = payload[0 .. payload.len - pad_len];
 
                 if (f.header.flags.has(Flags.end_headers)) {
-                    // Complete header block in a single HEADERS frame
                     last_client_stream_id = f.header.stream_id;
-                    processRequest(
-                        &registry,
-                        &decoder,
-                        &encoder,
-                        &flow,
-                        &settings_sync.peer,
-                        fragment,
-                        f.header.stream_id,
-                        f.header.flags.has(Flags.end_stream),
-                        writer,
-                        handler,
-                        io,
-                    );
+                    if (f.header.flags.has(Flags.end_stream)) {
+                        // No body — process immediately
+                        processRequest(
+                            &registry, &decoder, &encoder, &flow,
+                            &settings_sync.peer, fragment,
+                            f.header.stream_id, &.{}, writer, handler, io,
+                        );
+                    } else {
+                        // Body will follow via DATA frames — store headers
+                        if (fragment.len <= pending_header_block.len) {
+                            @memcpy(pending_header_block[0..fragment.len], fragment);
+                            pending_header_block_len = fragment.len;
+                            pending_stream_id = f.header.stream_id;
+                            body_len = 0;
+                        } else {
+                            try frame.writeRstStream(writer, f.header.stream_id, .internal_error);
+                            try writer.flush();
+                        }
+                    }
                 } else {
                     // Start of multi-frame header block — buffer it
                     if (fragment.len > header_block_buf.len) {
@@ -279,19 +294,22 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
 
                 if (f.header.flags.has(Flags.end_headers)) {
                     last_client_stream_id = header_block_stream_id;
-                    processRequest(
-                        &registry,
-                        &decoder,
-                        &encoder,
-                        &flow,
-                        &settings_sync.peer,
-                        header_block_buf[0..header_block_len],
-                        header_block_stream_id,
-                        header_block_end_stream,
-                        writer,
-                        handler,
-                        io,
-                    );
+                    const assembled = header_block_buf[0..header_block_len];
+                    if (header_block_end_stream) {
+                        processRequest(
+                            &registry, &decoder, &encoder, &flow,
+                            &settings_sync.peer, assembled,
+                            header_block_stream_id, &.{}, writer, handler, io,
+                        );
+                    } else {
+                        // Body will follow — store headers
+                        if (assembled.len <= pending_header_block.len) {
+                            @memcpy(pending_header_block[0..assembled.len], assembled);
+                            pending_header_block_len = assembled.len;
+                            pending_stream_id = header_block_stream_id;
+                            body_len = 0;
+                        }
+                    }
                     header_block_len = 0;
                     header_block_stream_id = 0;
                 }
@@ -303,13 +321,8 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                     return;
                 }
 
-                // Flow control: account for received data
-                var data_len: usize = f.payload.len;
-                if (f.header.flags.has(Flags.padded) and data_len > 0) {
-                    data_len -= 1; // pad length byte
-                    data_len -= f.payload[0]; // padding
-                }
-                if (data_len > 0) {
+                // Flow control: account for received data (entire payload including padding)
+                if (f.payload.len > 0) {
                     const should_update = flow.recordRecv(@intCast(f.payload.len)) catch {
                         try sendGoaway(writer, last_client_stream_id, .flow_control_error);
                         return;
@@ -327,6 +340,33 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                     }
                 }
 
+                // Strip padding to get actual data
+                var data_payload = f.payload;
+                var pad_len: usize = 0;
+                if (f.header.flags.has(Flags.padded) and data_payload.len > 0) {
+                    pad_len = data_payload[0];
+                    data_payload = data_payload[1..];
+                }
+                if (pad_len > data_payload.len) {
+                    try sendGoaway(writer, last_client_stream_id, .protocol_error);
+                    return;
+                }
+                const actual_data = data_payload[0 .. data_payload.len - pad_len];
+
+                // Buffer request body data
+                if (actual_data.len > 0 and pending_stream_id == f.header.stream_id) {
+                    if (body_len + actual_data.len > body_buf.len) {
+                        try frame.writeRstStream(writer, f.header.stream_id, .refused_stream);
+                        try writer.flush();
+                        body_len = 0;
+                        pending_stream_id = 0;
+                        pending_header_block_len = 0;
+                        continue;
+                    }
+                    @memcpy(body_buf[body_len..][0..actual_data.len], actual_data);
+                    body_len += actual_data.len;
+                }
+
                 // Update stream state
                 if (registry.get(f.header.stream_id)) |s| {
                     s.recv(f.header.frame_type, f.header.flags) catch {
@@ -334,7 +374,20 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                         try writer.flush();
                     };
                 }
-                // TODO: buffer request body data and deliver to handler
+
+                // END_STREAM on DATA — request is complete, dispatch to handler
+                if (f.header.flags.has(Flags.end_stream) and pending_stream_id == f.header.stream_id and pending_header_block_len > 0) {
+                    processRequest(
+                        &registry, &decoder, &encoder, &flow,
+                        &settings_sync.peer,
+                        pending_header_block[0..pending_header_block_len],
+                        pending_stream_id, body_buf[0..body_len],
+                        writer, handler, io,
+                    );
+                    pending_stream_id = 0;
+                    pending_header_block_len = 0;
+                    body_len = 0;
+                }
             },
 
             .rst_stream => {
@@ -382,12 +435,12 @@ fn processRequest(
     peer_settings: *const Settings,
     header_block: []const u8,
     stream_id: u31,
-    end_stream: bool,
+    request_body: []const u8,
     writer: *Io.Writer,
     handler: Handler,
     io: Io,
 ) void {
-    processRequestImpl(registry, decoder, encoder, flow, peer_settings, header_block, stream_id, end_stream, writer, handler, io) catch {
+    processRequestImpl(registry, decoder, encoder, flow, peer_settings, header_block, stream_id, request_body, writer, handler, io) catch {
         // Send RST_STREAM on error
         frame.writeRstStream(writer, stream_id, .internal_error) catch {};
         writer.flush() catch {};
@@ -402,7 +455,7 @@ fn processRequestImpl(
     peer_settings: *const Settings,
     header_block: []const u8,
     stream_id: u31,
-    end_stream: bool,
+    request_body: []const u8,
     writer: *Io.Writer,
     handler: Handler,
     io: Io,
@@ -422,12 +475,18 @@ fn processRequestImpl(
     };
 
     // Transition stream state for HEADERS recv
-    const flags_value: u8 = Flags.end_headers | if (end_stream) Flags.end_stream else 0;
-    stream.recv(.headers, .{ .value = flags_value }) catch {
-        try frame.writeRstStream(writer, stream_id, .protocol_error);
-        try writer.flush();
-        return;
-    };
+    // For requests with body, the stream was already opened by the frame loop
+    // when it received HEADERS without END_STREAM. For bodyless requests, we
+    // transition here.
+    if (stream.state == .idle) {
+        const es = request_body.len == 0;
+        const flags_value: u8 = Flags.end_headers | if (es) Flags.end_stream else 0;
+        stream.recv(.headers, .{ .value = flags_value }) catch {
+            try frame.writeRstStream(writer, stream_id, .protocol_error);
+            try writer.flush();
+            return;
+        };
+    }
 
     // Decode HPACK headers
     var decoded_headers: [hpack.max_decoded_headers]hpack.HeaderField = undefined;
@@ -511,9 +570,27 @@ fn processRequestImpl(
         pos += 2;
     }
 
+    // Add Content-Length for request body
+    if (request_body.len > 0) {
+        var cl_tmp: [20]u8 = undefined;
+        const cl_str = std.fmt.bufPrint(&cl_tmp, "{d}", .{request_body.len}) catch unreachable;
+        @memcpy(request_buf[pos..][0..16], "Content-Length: ");
+        pos += 16;
+        @memcpy(request_buf[pos..][0..cl_str.len], cl_str);
+        pos += cl_str.len;
+        @memcpy(request_buf[pos..][0..2], "\r\n");
+        pos += 2;
+    }
+
     // End of headers
     @memcpy(request_buf[pos..][0..2], "\r\n");
     pos += 2;
+
+    // Append request body
+    if (request_body.len > 0 and pos + request_body.len <= request_buf.len) {
+        @memcpy(request_buf[pos..][0..request_body.len], request_body);
+        pos += request_body.len;
+    }
 
     // Parse the synthetic request
     const request = Request.parse(request_buf[0..pos]) catch {
@@ -521,6 +598,19 @@ fn processRequestImpl(
         try writer.flush();
         return;
     };
+
+    // RFC 9113 §8.5: 100-continue — send informational HEADERS if client expects it
+    if (request.headers.get("expect")) |expect_val| {
+        if (Headers.eqlIgnoreCase(expect_val, "100-continue")) {
+            // Send :status 100 as an informational response HEADERS frame
+            var info_hdr_buf: [64]u8 = undefined;
+            const info_len = encoder.encodeHeader(&info_hdr_buf, ":status", "100") catch 0;
+            if (info_len > 0) {
+                frame.writeFrame(writer, .headers, .{ .value = Flags.end_headers }, stream_id, info_hdr_buf[0..info_len]) catch {};
+                writer.flush() catch {};
+            }
+        }
+    }
 
     // Call the handler
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

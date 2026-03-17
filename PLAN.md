@@ -116,11 +116,11 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 - [x] **Request mapping** — HPACK-decoded pseudo-headers → synthetic HTTP/1.1 request → existing `Request.parse` → handler
 - [x] **Response mapping** — `Response` → HPACK-encoded HEADERS frame (`:status` + headers) + DATA frames, with frame splitting for large payloads
 - [x] **Prohibited headers** — Connection, Keep-Alive, Transfer-Encoding, Upgrade stripped from both request and response
-- [ ] **100-continue** — Send informational HEADERS (`:status: 100`) before final response
-- [ ] **Trailers** — Send trailing HEADERS frame with END_STREAM
+- [x] **100-continue** — Sends informational `:status: 100` HEADERS when client sends `expect: 100-continue`
+- [ ] **Trailers** — Not yet supported (handler API has no trailer field; future enhancement)
 - [x] **PING/GOAWAY handling** — PING ACK responses; GOAWAY on protocol errors with last-stream-id
-- [ ] **Graceful shutdown** — GOAWAY with NO_ERROR, then allow in-flight streams to complete
-- [ ] **Request body support** — Buffer DATA frames and deliver to handler
+- [x] **Graceful shutdown** — Deferred GOAWAY with NO_ERROR on clean frame loop exit
+- [x] **Request body support** — DATA frames buffered per-stream (up to 1 MiB); body included in synthetic request with Content-Length; handler receives full body
 
 ### RFC References
 - §8.1 (message framing), §8.2 (fields), §8.3 (control data), §9.1 (connection management)
