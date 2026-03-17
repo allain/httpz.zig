@@ -5,6 +5,7 @@ const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Headers = @import("../Headers.zig");
 const tls = @import("tls");
+const H2Client = @import("H2Client.zig");
 
 /// RFC 2616: HTTP/1.1 Client implementation.
 ///
@@ -98,6 +99,12 @@ tls_output_buf: [tls.output_buffer_len]u8 = undefined,
 read_buf: []u8,
 write_buf: []u8,
 allocator: std.mem.Allocator,
+/// HTTP/2 client state — initialized when ALPN negotiates "h2".
+h2_client: ?H2Client = null,
+tls_read_buf_h2: [8192]u8 = undefined,
+tls_write_buf_h2: [8192]u8 = undefined,
+tls_reader_h2: ?tls.Connection.Reader = null,
+tls_writer_h2: ?tls.Connection.Writer = null,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const buf_size = @max(config.read_buffer_size, config.write_buffer_size);
@@ -138,12 +145,31 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
         self.tls_conn = tls.client(&self.tls_reader.?.interface, &self.tls_writer.?.interface, tls_config) catch {
             return error.ConnectionFailed;
         };
+
+        // Check if ALPN negotiated HTTP/2
+        if (self.tls_conn) |*tc| {
+            if (tc.alpn_protocol) |proto| {
+                if (std.mem.eql(u8, proto, "h2")) {
+                    self.tls_reader_h2 = tc.reader(&self.tls_read_buf_h2);
+                    self.tls_writer_h2 = tc.writer(&self.tls_write_buf_h2);
+                    self.h2_client = H2Client.init(&self.tls_reader_h2.?.interface, &self.tls_writer_h2.?.interface);
+                    self.h2_client.?.handshake() catch {
+                        self.h2_client = null;
+                        return error.ConnectionFailed;
+                    };
+                }
+            }
+        }
     } else {
         self.stream = stream;
     }
 }
 
 pub fn close(self: *Client) void {
+    if (self.h2_client) |*h2c| {
+        h2c.close();
+        self.h2_client = null;
+    }
     if (self.stream) |_| {
         self.stream = null;
     }
@@ -151,6 +177,13 @@ pub fn close(self: *Client) void {
 }
 
 pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
+    // HTTP/2 path
+    if (self.h2_client) |*h2c| {
+        const scheme: []const u8 = if (self.config.tls_config != null) "https" else "http";
+        return h2c.request(self.allocator, method, self.config.host, uri, scheme, headers, body) catch
+            return error.InvalidResponse;
+    }
+
     if (self.tls_conn) |*conn| {
         return try self.requestTls(conn, method, uri, headers, body);
     }
@@ -493,7 +526,7 @@ fn parseStatusLine(data: []const u8, response: *Response) ResponseParseError!voi
     response.status = intToStatusCode(status_code) orelse return error.InvalidStatusCode;
 }
 
-fn intToStatusCode(code: u16) ?Response.StatusCode {
+pub fn intToStatusCode(code: u16) ?Response.StatusCode {
     return switch (code) {
         100 => .@"continue",
         101 => .switching_protocols,

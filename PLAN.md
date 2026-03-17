@@ -131,10 +131,10 @@ The `tls.zig` dependency defines the ALPN extension type (16) but has zero imple
 **Extend the existing httpz client**
 
 ### Tasks
-- [ ] **ALPN negotiation** — Request `h2` during TLS handshake; fall back to HTTP/1.1
-- [ ] **Connection preface** — Send the 24-byte magic + initial SETTINGS
-- [ ] **Request sending** — Convert client request into HEADERS + DATA frames on a new odd-numbered stream
-- [ ] **Response receiving** — Reassemble HEADERS + DATA into a response; handle informational (1xx) responses
+- [x] **ALPN negotiation** — Client checks `tls_conn.alpn_protocol` after TLS handshake; if `h2`, initializes H2Client
+- [x] **Connection preface** — H2Client sends 24-byte magic + SETTINGS, reads server SETTINGS, exchanges ACKs
+- [x] **Request sending** — HPACK-encodes pseudo-headers + regular headers into HEADERS frame, sends DATA for body
+- [x] **Response receiving** — Reads HEADERS + DATA frames, handles SETTINGS/PING/WINDOW_UPDATE interleaved, skips 1xx informational responses, assembles body from DATA parts
 - [ ] **Stream multiplexing** — Support multiple concurrent requests on a single connection (connection pooling)
 - [ ] **Prior knowledge mode** — Support cleartext HTTP/2 (h2c) when configured
 
