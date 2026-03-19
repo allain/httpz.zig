@@ -23,6 +23,16 @@ const ErrorCode = h2.ErrorCode;
 
 const Handler = Connection.Handler;
 
+/// RFC 9113 §8.2: Header field names MUST be lowercase in HTTP/2.
+/// Returns a stack buffer with the lowercased name.
+fn lowerHeaderName(buf: *[256]u8, name: []const u8) []const u8 {
+    if (name.len > buf.len) return name;
+    for (name, 0..) |c, i| {
+        buf[i] = std.ascii.toLower(c);
+    }
+    return buf[0..name.len];
+}
+
 /// Serve an HTTP/2 connection.
 ///
 /// This is called after TLS negotiation selects "h2" via ALPN, or
@@ -725,12 +735,13 @@ fn processRequestImpl(
             var push_status_str: [3]u8 = undefined;
             _ = std.fmt.bufPrint(&push_status_str, "{d}", .{push_response.status.toInt()}) catch break;
             push_hpos += encoder.encodeHeader(push_resp_buf[push_hpos..], ":status", &push_status_str) catch break;
+            var push_lower_buf: [256]u8 = undefined;
             for (push_response.headers.entries[0..push_response.headers.len]) |entry| {
                 if (entry.name.len == 0) continue;
                 if (Headers.eqlIgnoreCase(entry.name, "connection")) continue;
                 if (Headers.eqlIgnoreCase(entry.name, "transfer-encoding")) continue;
                 if (push_hpos + entry.name.len + entry.value.len + 10 > push_resp_buf.len) break;
-                push_hpos += encoder.encodeHeader(push_resp_buf[push_hpos..], entry.name, entry.value) catch break;
+                push_hpos += encoder.encodeHeader(push_resp_buf[push_hpos..], lowerHeaderName(&push_lower_buf, entry.name), entry.value) catch break;
             }
 
             const push_has_body = !push_response.strip_body and push_response.body.len > 0;
@@ -757,7 +768,8 @@ fn processRequestImpl(
     _ = std.fmt.bufPrint(&status_str, "{d}", .{response.status.toInt()}) catch unreachable;
     hpos += try encoder.encodeHeader(resp_header_buf[hpos..], ":status", &status_str);
 
-    // Response headers
+    // Response headers (RFC 9113 §8.2: names must be lowercase)
+    var lower_buf: [256]u8 = undefined;
     for (response.headers.entries[0..response.headers.len]) |entry| {
         if (entry.name.len == 0) continue;
         // Skip HTTP/1.1-only headers
@@ -765,7 +777,7 @@ fn processRequestImpl(
         if (Headers.eqlIgnoreCase(entry.name, "keep-alive")) continue;
         if (Headers.eqlIgnoreCase(entry.name, "transfer-encoding")) continue;
         if (hpos + entry.name.len + entry.value.len + 10 > resp_header_buf.len) break;
-        hpos += try encoder.encodeHeader(resp_header_buf[hpos..], entry.name, entry.value);
+        hpos += try encoder.encodeHeader(resp_header_buf[hpos..], lowerHeaderName(&lower_buf, entry.name), entry.value);
     }
 
     // Content-Length if we have a body and auto_content_length
@@ -833,10 +845,11 @@ fn processRequestImpl(
         var trailer_buf: [4096]u8 = undefined;
         var tpos: usize = 0;
         const trailers = response.trailers.?;
+        var trailer_lower_buf: [256]u8 = undefined;
         for (trailers.entries[0..trailers.len]) |entry| {
             if (entry.name.len == 0) continue;
             if (tpos + entry.name.len + entry.value.len + 10 > trailer_buf.len) break;
-            tpos += encoder.encodeHeader(trailer_buf[tpos..], entry.name, entry.value) catch break;
+            tpos += encoder.encodeHeader(trailer_buf[tpos..], lowerHeaderName(&trailer_lower_buf, entry.name), entry.value) catch break;
         }
         if (tpos > 0) {
             const trailer_flags: u8 = Flags.end_headers | Flags.end_stream;
