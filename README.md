@@ -1,11 +1,12 @@
 # httpz
 
-An HTTP/1.1 library for Zig 0.16, built on the `std.Io` async model.
+An HTTP/1.1 and HTTP/2 library for Zig 0.16, built on the `std.Io` async model.
 
 ## Features
 
-- **HTTP Server** — keep-alive, chunked transfer encoding, connection limits, slowloris protection
-- **HTTP Client** — configurable timeouts, response size limits
+- **HTTP Server** — HTTP/1.1 and HTTP/2, keep-alive, chunked transfer encoding, connection limits, slowloris protection
+- **HTTP Client** — HTTP/1.1 and HTTP/2, configurable timeouts, response size limits
+- **HTTP/2** — ALPN negotiation, h2c (cleartext), HPACK compression, stream multiplexing, flow control, server push, trailers
 - **Router** — path parameters (`:id`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
@@ -13,7 +14,7 @@ An HTTP/1.1 library for Zig 0.16, built on the `std.Io` async model.
 - **HTTPS / TLS** — server and client TLS via [tls.zig](https://github.com/allain/tls.zig)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
 - **Cookies** — RFC 6265 cookie parsing and Set-Cookie generation with Secure, HttpOnly, SameSite, Max-Age, Domain, Path
-- **RFC 2616 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
+- **RFC 2616 / RFC 9113 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
 
 ## Quick Start
 
@@ -396,6 +397,65 @@ var client = httpz.Client.init(allocator, .{
     },
 });
 ```
+
+## HTTP/2
+
+HTTP/2 is supported transparently — handlers use the same `Request` and `Response` API regardless of protocol version.
+
+### Automatic Negotiation
+
+Over TLS, the server and client negotiate HTTP/2 via ALPN. No configuration is needed — if the peer supports `h2`, it is used automatically.
+
+### h2c (Cleartext HTTP/2)
+
+On the server side, h2c is detected automatically via the HTTP/2 connection preface.
+
+On the client side, enable h2c with `h2_prior_knowledge`:
+
+```zig
+var client = httpz.Client.init(allocator, .{
+    .host = "localhost",
+    .port = 8080,
+    .h2_prior_knowledge = true,
+});
+```
+
+### Server Push
+
+Handlers can push up to 4 additional resources per response. The server sends a `PUSH_PROMISE` and then serves the pushed resource on a reserved stream.
+
+```zig
+fn handler(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
+    var resp = httpz.Response.init(.ok, "text/html", "<html>...</html>");
+    resp.addPush("/style.css");
+    resp.addPush("/app.js");
+    return resp;
+}
+```
+
+Push is only sent when the client has not disabled it via `SETTINGS_ENABLE_PUSH=0`.
+
+### Trailers
+
+Responses can include trailing headers, sent after the body as a final HEADERS frame:
+
+```zig
+fn handler(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
+    var resp = httpz.Response.init(.ok, "application/octet-stream", body);
+    var trailers = httpz.Headers.init(allocator);
+    trailers.append("checksum", "sha256=abc123") catch {};
+    resp.trailers = trailers;
+    return resp;
+}
+```
+
+### Protocol Details
+
+- Full RFC 9113 binary framing (all 10 frame types)
+- HPACK header compression with static/dynamic tables and Huffman coding
+- Per-stream and connection-level flow control
+- Concurrent stream limits (default 100)
+- DoS protection: rapid reset detection, settings timeout, header size limits
 
 ## HTTP Client
 
