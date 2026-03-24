@@ -192,7 +192,7 @@ fn waitForPort(port: u16) void {
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
         if (Io.net.IpAddress.connect(
-            Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return,
+            &(Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return),
             io,
             .{ .mode = .stream },
         )) |probe| {
@@ -207,7 +207,7 @@ fn waitForPort(port: u16) void {
 fn rawRequest(port: u16, request_bytes: []const u8) ![]const u8 {
     const io = std.testing.io;
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return error.ConnectionFailed;
-    const stream = Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+    const stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
     defer stream.close(io);
 
     var write_buf: [4096]u8 = undefined;
@@ -507,7 +507,7 @@ test "integration: websocket upgrade and echo" {
     const io = std.testing.io;
 
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", router_port) catch unreachable;
-    const stream = Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch
+    const stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch
         return error.ConnectionFailed;
     defer stream.close(io);
 

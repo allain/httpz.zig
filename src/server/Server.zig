@@ -103,12 +103,12 @@ pub fn run(self: *Server, io: Io) RunError!void {
     // Check if something is already listening on this port.
     // reuse_address allows binding even when another process holds the port,
     // so we probe with a connect first.
-    if (Io.net.IpAddress.connect(addr, io, .{ .mode = .stream })) |probe| {
+    if (Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream })) |probe| {
         probe.close(io);
         return error.AddressInUse;
     } else |_| {}
 
-    var server = Io.net.IpAddress.listen(addr, io, .{ .reuse_address = true }) catch return error.AddressInUse;
+    var server = Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch return error.AddressInUse;
     defer server.deinit(io);
     var connection_group: Io.Group = .init;
     defer connection_group.cancel(io);
@@ -588,7 +588,7 @@ fn handleConnect(self: *Server, client_stream: Io.net.Stream, io: Io, request: *
         return;
     };
 
-    const target_stream = Io.net.IpAddress.connect(target_addr, io, .{ .mode = .stream }) catch {
+    const target_stream = Io.net.IpAddress.connect(&target_addr, io, .{ .mode = .stream }) catch {
         const resp: Response = .{ .status = .bad_gateway, .body = "Connection to target failed" };
         var resp_buf: [Response.max_response_header_len]u8 = undefined;
         const resp_data = resp.serialize(&resp_buf) catch return;
