@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Connecting to {s}:{}...\n", .{ url.host, url.port });
 
     const rng_impl: std.Random.IoSource = .{ .io = io };
-    const root_ca: tls.config.cert.Bundle = .{};
+    const root_ca: tls.config.cert.Bundle = .empty;
 
     var client = Client.init(allocator, .{
         .host = url.host,
