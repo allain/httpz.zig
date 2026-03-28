@@ -196,6 +196,117 @@ pub fn close(self: *Client) void {
     self.tls_conn = null;
 }
 
+/// A streaming response where headers have been parsed but the body
+/// is available as a reader for incremental consumption (e.g., SSE streams).
+pub const StreamResponse = struct {
+    response: Response,
+    reader: *Io.Reader,
+    chunked: bool,
+    content_length: ?usize,
+};
+
+/// Like `request`, but returns a `StreamResponse` with the body reader
+/// instead of buffering the entire response body. The caller reads the
+/// body incrementally via `stream_resp.reader`.
+///
+/// The caller must NOT call `response.deinit()` until done reading.
+pub fn requestStream(self: *Client, io: Io, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!StreamResponse {
+    // HTTP/2 not supported for streaming — fall back to buffered
+    if (self.h2_client != null) return error.InvalidResponse;
+
+    if (self.tls_conn != null) {
+        // TLS streaming not yet supported — requires incremental TLS reads
+        return error.InvalidResponse;
+    }
+
+    const stream = self.stream orelse return error.ConnectionFailed;
+
+    var reader = Io.net.Stream.Reader.init(stream, io, self.read_buf);
+    var writer = Io.net.Stream.Writer.init(stream, io, self.write_buf);
+
+    try self.sendRequest(&writer, method, uri, headers, body);
+    writer.interface.flush() catch return error.SendFailed;
+
+    return try self.readResponseHeaders(&reader.interface);
+}
+
+/// Parse response headers only, leaving the reader positioned at the body start.
+fn readResponseHeaders(self: *Client, reader: *Io.Reader) ResponseParseError!StreamResponse {
+    _ = self;
+    var response: Response = .{};
+    var header_buf: [8192]u8 = undefined;
+    var header_pos: usize = 0;
+
+    while (true) {
+        const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => {
+                if (header_pos == 0) return error.InvalidResponse;
+                break;
+            },
+            error.StreamTooLong => {
+                if (header_pos == 0) return error.InvalidResponse;
+                break;
+            },
+            else => return error.InvalidResponse,
+        };
+
+        if (header_pos + line.len > header_buf.len) return error.ResponseTooLarge;
+        @memcpy(header_buf[header_pos..][0..line.len], line);
+        header_pos += line.len;
+
+        if (line.len == 2 and line[0] == '\r' and line[1] == '\n') {
+            break;
+        }
+    }
+
+    const header_str = header_buf[0..header_pos];
+
+    const status_line_end = std.mem.indexOf(u8, header_str, "\r\n") orelse return error.InvalidResponse;
+    try parseStatusLine(header_str[0..status_line_end], &response);
+
+    var pos: usize = status_line_end + 2;
+    while (pos + 1 < header_str.len) {
+        const line_end = blk: {
+            var j = pos;
+            while (j + 1 < header_str.len) : (j += 1) {
+                if (header_str[j] == '\r' and header_str[j + 1] == '\n') break :blk j;
+            }
+            break :blk header_str.len;
+        };
+        const line = header_str[pos..line_end];
+        pos = if (line_end + 2 <= header_str.len) line_end + 2 else header_str.len;
+
+        if (line.len == 0) break;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+        const name = line[0..colon];
+        const value = Request.trimOws(line[colon + 1 ..]);
+
+        response.headers.append(name, value) catch return error.ResponseTooLarge;
+    }
+
+    const te = response.headers.get("Transfer-Encoding");
+    const is_chunked = te != null and Headers.eqlIgnoreCase(te.?, "chunked");
+
+    var content_length: ?usize = null;
+    if (!is_chunked) {
+        if (response.headers.get("Content-Length")) |cl_str| {
+            content_length = std.fmt.parseInt(usize, cl_str, 10) catch null;
+        }
+    }
+
+    if (is_chunked) {
+        response.chunked = true;
+    }
+
+    return .{
+        .response = response,
+        .reader = reader,
+        .chunked = is_chunked,
+        .content_length = content_length,
+    };
+}
+
 pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
     // HTTP/2 path
     if (self.h2_client) |*h2c| {
