@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const httpz = @import("httpz");
-const tls = @import("tls");
+const tls = httpz.tls;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -26,15 +26,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer auth.deinit(allocator);
 
-    const rng_impl: std.Random.IoSource = .{ .io = io };
-
     var server = httpz.Server.init(.{
         .port = 4433,
         .address = "127.0.0.1",
         .tls_config = .{
             .auth = &auth,
-            .now = std.Io.Clock.real.now(io),
-            .rng = rng_impl.interface(),
         },
     }, handler);
 

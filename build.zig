@@ -4,16 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // TLS module from dependency
-    const tls_pkg = b.dependency("tls", .{});
-    const tls_mod = tls_pkg.module("tls");
-
     // Library module
     const httpz_mod = b.addModule("httpz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
-    httpz_mod.addImport("tls", tls_mod);
+    httpz_mod.linkSystemLibrary("ssl", .{});
+    httpz_mod.linkSystemLibrary("crypto", .{});
 
     // Example executables
     const examples = [_][]const u8{
@@ -33,7 +30,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "httpz", .module = httpz_mod },
-                .{ .name = "tls", .module = tls_mod },
             },
         });
         const example_exe = b.addExecutable(.{

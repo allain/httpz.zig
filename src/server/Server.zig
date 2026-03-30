@@ -1,7 +1,7 @@
 const Server = @This();
 const std = @import("std");
 const Io = std.Io;
-const tls = @import("tls");
+const tls = @import("../openssl.zig");
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Connection = @import("Connection.zig");
@@ -143,33 +143,28 @@ pub fn run(self: *Server, io: Io) RunError!void {
 ///
 /// RFC 2616 Section 8.1: Persistent Connections
 fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
-    // Apply initial read timeout to prevent slowloris attacks on new connections.
-    // This is set before the first read and later replaced by keep_alive_timeout.
-    // NOTE: SO_RCVTIMEO is not used here because it causes EAGAIN on
-    // Linux when it fires, and Zig's threaded I/O backend treats EAGAIN
-    // on blocking sockets as a programmer bug (panic). Idle connections
-    // close naturally via EndOfStream when the client disconnects.
+    const fd = stream.socket.handle;
 
-    // TLS records can be up to ~16KB and must be read in full, so use
-    // TLS-sized buffers for the underlying TCP reader/writer.
+    // TLS handshake if configured — OpenSSL uses the socket fd directly
+    var tls_conn: ?tls.Connection = null;
+    var tls_read_buf: [8192]u8 = undefined;
+    var tls_write_buf: [8192]u8 = undefined;
+
+    // Buffered TCP reader/writer for plain HTTP and error responses.
+    // For TLS connections, OpenSSL reads/writes the socket directly,
+    // so these are only used for the plain HTTP path.
     var read_buf: [tls.input_buffer_len]u8 = undefined;
     var write_buf: [tls.output_buffer_len]u8 = undefined;
     var net_reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
     var net_writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
 
-    // TLS handshake if configured
-    var tls_conn: ?tls.Connection = null;
-    var tls_read_buf: [8192]u8 = undefined;
-    var tls_write_buf: [8192]u8 = undefined;
-
     if (self.config.tls_config) |tls_config| {
         // Peek at the first byte to detect plain HTTP on a TLS port.
-        // TLS records start with 0x16 (handshake). ASCII letters indicate
-        // a plain HTTP request (e.g. "GET", "POST", "HEAD").
-        const first = net_reader.interface.peek(1) catch {
-            return;
-        };
-        if (first.len > 0 and first[0] != 0x16) {
+        // Use MSG_PEEK at the socket level so the byte remains available
+        // to OpenSSL for the handshake.
+        var peek_buf: [1]u8 = undefined;
+        const peek_result = std.posix.system.recvfrom(fd, &peek_buf, 1, std.os.linux.MSG.PEEK, null, null);
+        if (peek_result > 0 and peek_buf[0] != 0x16) {
             net_writer.interface.writeAll(
                 "HTTP/1.1 400 Bad Request\r\n" ++
                     "Content-Type: text/plain\r\n" ++
@@ -182,14 +177,13 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             return;
         }
 
-        tls_conn = tls.server(&net_reader.interface, &net_writer.interface, tls_config) catch {
+        tls_conn = tls.server(fd, tls_config) catch {
             return;
         };
     }
     defer if (tls_conn) |*tc| {
         tc.close() catch {};
-        // Flush the close_notify through the buffered TCP writer
-        net_writer.interface.flush() catch {};
+        tc.deinit();
     };
 
     // Get the appropriate reader/writer interfaces - either TLS or plain TCP
@@ -220,8 +214,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         }
     }
 
-    // Detect TLS ClientHello on a non-TLS port. The first byte of a TLS
-    // record is 0x16 (handshake). Send a plain HTTP 400 and close.
+    // Detect TLS ClientHello on a non-TLS port.
     if (self.config.tls_config == null) {
         const first = net_reader.interface.peek(1) catch {
             return;
@@ -416,14 +409,12 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             };
             writer.writeAll(header_data) catch return;
             writer.flush() catch return;
-            if (tls_conn != null) net_writer.interface.flush() catch return;
 
             // Call stream function with the network writer
             stream_fn(response.stream_context, writer);
 
             // Final flush
             writer.flush() catch return;
-            if (tls_conn != null) net_writer.interface.flush() catch return;
             response.deinit(request_allocator);
             // Streaming responses don't keep-alive (simplicity)
             return;
@@ -454,9 +445,6 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             }
         }
         writer.flush() catch return;
-        // TLS writer flush encrypts into the buffered TCP writer;
-        // flush the TCP layer so the response actually reaches the client.
-        if (tls_conn != null) net_writer.interface.flush() catch return;
 
         // Free any allocated body (e.g. from gzip compression)
         response.deinit(request_allocator);

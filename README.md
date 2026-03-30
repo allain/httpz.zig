@@ -11,7 +11,7 @@ An HTTP/1.1 and HTTP/2 library for Zig 0.16, built on the `std.Io` async model.
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
 - **Middleware** — CORS and gzip compression via composable `wrap` functions
-- **HTTPS / TLS** — server and client TLS via [tls.zig](https://github.com/allain/tls.zig)
+- **HTTPS / TLS** — server and client TLS via [OpenSSL](https://github.com/openssl/openssl)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
 - **Cookies** — RFC 6265 cookie parsing and Set-Cookie generation with Secure, HttpOnly, SameSite, Max-Age, Domain, Path
 - **RFC 2616 / RFC 9113 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
@@ -367,7 +367,7 @@ The third argument is the maximum allowed file size in bytes (0 for unlimited). 
 ### Server
 
 ```zig
-const tls = @import("tls");
+const tls = httpz.tls;
 
 var auth = tls.config.CertKeyPair.fromFilePath(allocator, io, cert_dir, "cert.pem", "key.pem") catch return error.InvalidCertificate;
 defer auth.deinit(allocator);
@@ -377,8 +377,6 @@ var server = httpz.Server.init(.{
     .address = "127.0.0.1",
     .tls_config = .{
         .auth = &auth,
-        .now = std.Io.Clock.real.now(io),
-        .rng = rng.interface(),
     },
 }, handler);
 ```
@@ -391,9 +389,7 @@ var client = httpz.Client.init(allocator, .{
     .port = 443,
     .tls_config = .{
         .host = "example.com",
-        .root_ca = .{},
-        .now = std.Io.Clock.real.now(io),
-        .rng = rng.interface(),
+        .root_ca = .system,
     },
 });
 ```

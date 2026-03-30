@@ -2,7 +2,6 @@ const std = @import("std");
 const Io = std.Io;
 const httpz = @import("httpz");
 const Client = httpz.Client;
-const tls = @import("tls");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -13,9 +12,6 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Connecting to {s}:{}...\n", .{ url.host, url.port });
 
-    const rng_impl: std.Random.IoSource = .{ .io = io };
-    const root_ca: tls.config.cert.Bundle = .empty;
-
     var client = Client.init(allocator, .{
         .host = url.host,
         .port = url.port,
@@ -23,10 +19,7 @@ pub fn main(init: std.process.Init) !void {
         .read_timeout_s = 10,
         .tls_config = .{
             .host = url.host,
-            .root_ca = root_ca,
-            .insecure_skip_verify = true,
-            .now = std.Io.Clock.real.now(io),
-            .rng = rng_impl.interface(),
+            .root_ca = .system,
         },
     });
     defer client.deinit();

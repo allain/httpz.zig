@@ -3,16 +3,16 @@
 ## Current State
 
 - Fully RFC 2616-compliant HTTP/1.1 server and client
-- TLS 1.3 via `tls.zig` dependency (no ALPN support yet)
+- TLS via OpenSSL (with ALPN support)
 - Binary framing, multiplexing, HPACK — all unimplemented
 - Branch `http2` exists but is clean (no work started)
 
 ---
 
-## Phase 0: ALPN Negotiation in tls.zig
+## Phase 0: ALPN Negotiation *(completed)*
 **Prerequisite — unblocks everything else**
 
-The `tls.zig` dependency defines the ALPN extension type (16) but has zero implementation. Without ALPN, clients and servers cannot negotiate `h2`.
+ALPN negotiation is handled by OpenSSL. Clients and servers negotiate `h2` automatically.
 
 ### Tasks
 - [x] **Client ALPN** — Add `alpn_protocols: []const []const u8` to client `Options`; write the ALPN extension in `makeClientHello`; parse the server's selected protocol from ServerHello/EncryptedExtensions
@@ -198,7 +198,7 @@ src/
 
 ## Key Risks & Considerations
 
-- **tls.zig is a vendored dependency** — ALPN changes (Phase 0) need to be upstreamed or maintained as a fork
+- **TLS is provided by system OpenSSL** — requires `libssl-dev` (or equivalent) installed on the build machine
 - **HPACK is complex** — Use RFC 7541 test vectors extensively; compression bugs corrupt the entire connection
 - **Multiplexing changes the concurrency model** — HTTP/1.1 is one-request-per-connection; HTTP/2 needs concurrent stream handling within a single connection
 - **Priority signaling is deprecated** — Implement PRIORITY frame parsing for interop but don't invest in complex scheduling (§5.3.2)

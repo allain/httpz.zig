@@ -4,14 +4,14 @@ const Io = std.Io;
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Headers = @import("../Headers.zig");
-const tls = @import("tls");
+const tls = @import("../openssl.zig");
 const H2Client = @import("H2Client.zig");
 
 /// RFC 2616: HTTP/1.1 Client implementation.
 ///
 /// This client uses the Zig 0.16 std.Io interface for networking,
 /// supporting both threaded and evented I/O backends.
-/// TLS support is provided by the tls.zig library.
+/// TLS support is provided by OpenSSL.
 pub const Config = struct {
     host: []const u8,
     port: u16 = 80,
@@ -96,10 +96,6 @@ pub const ResponseParseError = ClientError || error{
 config: Config,
 stream: ?Io.net.Stream = null,
 tls_conn: ?tls.Connection = null,
-tls_reader: ?Io.net.Stream.Reader = null,
-tls_writer: ?Io.net.Stream.Writer = null,
-tls_input_buf: [tls.input_buffer_len]u8 = undefined,
-tls_output_buf: [tls.output_buffer_len]u8 = undefined,
 read_buf: []u8,
 write_buf: []u8,
 allocator: std.mem.Allocator,
@@ -124,8 +120,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const write_buf = allocator.alloc(u8, buf_size) catch unreachable;
     return .{
         .config = config,
-        .tls_input_buf = undefined,
-        .tls_output_buf = undefined,
         .read_buf = read_buf,
         .write_buf = write_buf,
         .allocator = allocator,
@@ -152,11 +146,11 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
     }
 
     if (self.config.tls_config) |tls_config| {
-        self.tls_reader = stream.reader(io, &self.tls_input_buf);
-        self.tls_writer = stream.writer(io, &self.tls_output_buf);
-        self.tls_conn = tls.client(&self.tls_reader.?.interface, &self.tls_writer.?.interface, tls_config) catch {
+        // OpenSSL uses the socket fd directly
+        self.tls_conn = tls.client(stream.socket.handle, tls_config) catch {
             return error.ConnectionFailed;
         };
+        self.stream = stream;
 
         // Check if ALPN negotiated HTTP/2
         if (self.tls_conn) |*tc| {
@@ -193,10 +187,14 @@ pub fn close(self: *Client) void {
         h2c.close();
         self.h2_client = null;
     }
+    if (self.tls_conn) |*tc| {
+        tc.close() catch {};
+        tc.deinit();
+        self.tls_conn = null;
+    }
     if (self.stream) |_| {
         self.stream = null;
     }
-    self.tls_conn = null;
 }
 
 /// A streaming response where headers have been parsed but the body
@@ -345,27 +343,9 @@ fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri:
 fn mapTlsError(err: anyerror) ResponseParseError {
     return switch (err) {
         error.WriteFailed => error.SendFailed,
-        error.ReadFailed => error.InvalidResponse,
-        error.TlsUnexpectedMessage => error.InvalidResponse,
-        error.TlsCipherNoSpaceLeft => error.SendFailed,
-        error.TlsAlertUnexpectedMessage,
-        error.TlsAlertBadRecordMac,
-        error.TlsAlertRecordOverflow,
-        error.TlsAlertHandshakeFailure,
-        error.TlsAlertDecodeError,
-        error.TlsAlertDecryptError,
-        error.TlsAlertInternalError,
-        => error.TlsHandshakeFailure,
-        error.TlsAlertBadCertificate,
-        error.TlsAlertUnsupportedCertificate,
-        error.TlsAlertCertificateUnknown,
-        => error.TlsUnsupportedCertificate,
-        error.TlsAlertCertificateRevoked => error.TlsCertificateRevoked,
-        error.TlsAlertCertificateExpired => error.TlsCertificateExpired,
-        error.TlsAlertCertificateRequired => error.TlsCertificateRequired,
-        error.TlsAlertUnknownCa,
-        error.TlsAlertAccessDenied,
-        => error.TlsHandshakeFailure,
+        error.ReadFailed, error.EndOfStream => error.InvalidResponse,
+        error.TlsAlert => error.TlsHandshakeFailure,
+        error.WouldBlock => error.InvalidResponse,
         else => error.InvalidResponse,
     };
 }
@@ -443,10 +423,10 @@ fn sendRequestTls(self: *Client, conn: *tls.Connection, method: Request.Method, 
     buf[pos] = '\n';
     pos += 1;
 
-    try conn.writeAll(buf[0..pos]);
+    conn.writeAll(buf[0..pos]) catch return error.SendFailed;
 
     if (has_body) {
-        try conn.writeAll(body.?);
+        conn.writeAll(body.?) catch return error.SendFailed;
     }
 }
 
@@ -492,11 +472,11 @@ fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response
 
         const body_start = header_end + 4;
         if (body_start + content_length <= data.len) {
-            const body = self.allocator.alloc(u8, content_length) catch
+            const body_data = self.allocator.alloc(u8, content_length) catch
                 return error.ResponseTooLarge;
-            @memcpy(body, data[body_start .. body_start + content_length]);
-            response.body = body;
-            response._body_allocated = body;
+            @memcpy(body_data, data[body_start .. body_start + content_length]);
+            response.body = body_data;
+            response._body_allocated = body_data;
         }
     }
 

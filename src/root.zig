@@ -22,7 +22,7 @@ pub const middleware = struct {
     pub const cors = @import("middleware/cors.zig");
 };
 pub const h2 = @import("h2/root.zig");
-pub const tls = @import("tls");
+pub const tls = @import("openssl.zig");
 
 const std = @import("std");
 
