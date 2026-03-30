@@ -114,6 +114,9 @@ h2c_net_reader: ?Io.net.Stream.Reader = null,
 h2c_net_writer: ?Io.net.Stream.Writer = null,
 h2c_read_buf: [8192]u8 = undefined,
 h2c_write_buf: [8192]u8 = undefined,
+/// Persistent net reader/writer for streaming responses
+stream_reader: ?Io.net.Stream.Reader = null,
+stream_writer: ?Io.net.Stream.Writer = null,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const buf_size = @max(config.read_buffer_size, config.write_buffer_size);
@@ -221,13 +224,13 @@ pub fn requestStream(self: *Client, io: Io, method: Request.Method, uri: []const
 
     const stream = self.stream orelse return error.ConnectionFailed;
 
-    var reader = Io.net.Stream.Reader.init(stream, io, self.read_buf);
-    var writer = Io.net.Stream.Writer.init(stream, io, self.write_buf);
+    self.stream_reader = Io.net.Stream.Reader.init(stream, io, self.read_buf);
+    self.stream_writer = Io.net.Stream.Writer.init(stream, io, self.write_buf);
 
-    try self.sendRequest(&writer, method, uri, headers, body);
-    writer.interface.flush() catch return error.SendFailed;
+    try self.sendRequest(&self.stream_writer.?, method, uri, headers, body);
+    self.stream_writer.?.interface.flush() catch return error.SendFailed;
 
-    return try self.readResponseHeaders(&reader.interface);
+    return try self.readResponseHeaders(&self.stream_reader.?.interface);
 }
 
 /// Parse response headers only, leaving the reader positioned at the body start.
