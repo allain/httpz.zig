@@ -513,9 +513,34 @@ fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response
     const te = response.headers.get("Transfer-Encoding");
     const is_chunked = te != null and Headers.eqlIgnoreCase(te.?, "chunked");
 
+    const body_start = header_end + 4;
+
     if (is_chunked) {
-        response.chunked = true;
-        response.body = "";
+        // Decode chunked transfer encoding from the TLS buffer
+        var decoded = std.ArrayList(u8).empty;
+        var chunk_pos = body_start;
+        while (chunk_pos < data.len) {
+            const chunk_header_end = std.mem.indexOf(u8, data[chunk_pos..], "\r\n") orelse break;
+            const size_str = std.mem.trim(u8, data[chunk_pos .. chunk_pos + chunk_header_end], " ");
+            // Strip chunk extensions (after semicolon)
+            const semi = std.mem.indexOfScalar(u8, size_str, ';');
+            const pure_size = if (semi) |s| size_str[0..s] else size_str;
+            const chunk_size = std.fmt.parseInt(usize, pure_size, 16) catch break;
+            if (chunk_size == 0) break;
+            chunk_pos += chunk_header_end + 2;
+            if (chunk_pos + chunk_size > data.len) break;
+            decoded.appendSlice(self.allocator, data[chunk_pos .. chunk_pos + chunk_size]) catch
+                return error.ResponseTooLarge;
+            chunk_pos += chunk_size + 2; // skip trailing \r\n
+        }
+        if (decoded.items.len > 0) {
+            const body_data = decoded.toOwnedSlice(self.allocator) catch
+                return error.ResponseTooLarge;
+            response.body = body_data;
+            response._body_allocated = body_data;
+        } else {
+            decoded.deinit(self.allocator);
+        }
         return response;
     }
 
@@ -526,7 +551,6 @@ fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response
 
         if (content_length > self.config.max_response_size) return error.ResponseTooLarge;
 
-        const body_start = header_end + 4;
         if (body_start + content_length <= data.len) {
             const body_data = self.allocator.alloc(u8, content_length) catch
                 return error.ResponseTooLarge;
