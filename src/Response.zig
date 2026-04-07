@@ -115,6 +115,8 @@ headers: Headers = .{},
 body: []const u8 = "",
 /// Internal: if non-null, the body was dynamically allocated and should be freed
 _body_allocated: ?[]u8 = null,
+/// Internal: backing buffer for TLS responses (headers point into this).
+_tls_buf: ?struct { ptr: [*]u8, len: usize, allocator: std.mem.Allocator } = null,
 version: @import("Request.zig").Version = .http_1_1,
 /// When true, serialize() will auto-generate a Content-Length header.
 auto_content_length: bool = true,
@@ -355,6 +357,10 @@ pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         allocator.free(allocated);
         self.body = "";
         self._body_allocated = null;
+    }
+    if (self._tls_buf) |tls_buf| {
+        tls_buf.allocator.free(tls_buf.ptr[0..tls_buf.len]);
+        self._tls_buf = null;
     }
 }
 

@@ -337,7 +337,7 @@ fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri:
     // Accumulate TLS records into a single buffer — large responses span
     // multiple records, so a single conn.next() is not enough.
     var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(self.allocator);
+    errdefer buf.deinit(self.allocator);
 
     while (true) {
         const data = conn.next() catch |err| return mapTlsError(err);
@@ -369,7 +369,14 @@ fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri:
     }
 
     if (buf.items.len == 0) return error.InvalidResponse;
-    return try self.parseTlsResponse(buf.items);
+    var response = try self.parseTlsResponse(buf.items);
+    // Transfer buffer ownership to response so headers remain valid
+    response._tls_buf = .{
+        .ptr = buf.items.ptr,
+        .len = buf.capacity,
+        .allocator = self.allocator,
+    };
+    return response;
 }
 
 /// Find a header value in raw header data (before \r\n\r\n).
