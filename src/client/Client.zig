@@ -334,10 +334,59 @@ pub fn request(self: *Client, io: Io, method: Request.Method, uri: []const u8, h
 fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!Response {
     try self.sendRequestTls(conn, method, uri, headers, body);
 
-    const data = conn.next() catch |err| return mapTlsError(err);
-    const response_data = data orelse return error.InvalidResponse;
+    // Accumulate TLS records into a single buffer — large responses span
+    // multiple records, so a single conn.next() is not enough.
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(self.allocator);
 
-    return try self.parseTlsResponse(response_data);
+    while (true) {
+        const data = conn.next() catch |err| return mapTlsError(err);
+        const chunk = data orelse break;
+        buf.appendSlice(self.allocator, chunk) catch return error.ResponseTooLarge;
+
+        // Check if we have enough data: find headers, then check content-length
+        if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |header_end| {
+            const header_data = buf.items[0..header_end];
+            // Look for Content-Length header
+            if (findHeaderValue(header_data, "Content-Length")) |cl_str| {
+                const content_length = std.fmt.parseInt(usize, cl_str, 10) catch break;
+                const body_start = header_end + 4;
+                if (buf.items.len >= body_start + content_length) break;
+            } else {
+                // No content-length (might be chunked or connection-close) — check for chunked
+                if (findHeaderValue(header_data, "Transfer-Encoding")) |te| {
+                    if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) {
+                        // For chunked, look for the terminating 0\r\n\r\n
+                        if (std.mem.indexOf(u8, buf.items[header_end + 4 ..], "0\r\n\r\n") != null) break;
+                        if (std.mem.indexOf(u8, buf.items[header_end + 4 ..], "\r\n0\r\n") != null) break;
+                    }
+                } else {
+                    // No content-length, not chunked — read until connection close
+                    // We'll get null from conn.next() when done
+                }
+            }
+        }
+    }
+
+    if (buf.items.len == 0) return error.InvalidResponse;
+    return try self.parseTlsResponse(buf.items);
+}
+
+/// Find a header value in raw header data (before \r\n\r\n).
+fn findHeaderValue(header_data: []const u8, name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < header_data.len) {
+        const line_end = std.mem.indexOf(u8, header_data[pos..], "\r\n") orelse header_data.len - pos;
+        const line = header_data[pos .. pos + line_end];
+        pos += line_end + 2;
+
+        if (line.len > name.len + 1 and line[name.len] == ':') {
+            if (std.ascii.eqlIgnoreCase(line[0..name.len], name)) {
+                return Request.trimOws(line[name.len + 1 ..]);
+            }
+        }
+    }
+    return null;
 }
 
 fn mapTlsError(err: anyerror) ResponseParseError {
