@@ -490,7 +490,8 @@ fn parseTlsResponse(self: *Client, data: []const u8) ResponseParseError!Response
     var response: Response = .{};
 
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.InvalidResponse;
-    const header_data = data[0..header_end];
+    // Include the trailing \r\n so the last header line is terminated
+    const header_data = data[0 .. header_end + 2];
 
     const status_line_end = std.mem.indexOf(u8, header_data, "\r\n") orelse return error.InvalidResponse;
     try parseStatusLine(header_data[0..status_line_end], &response);

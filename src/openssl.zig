@@ -117,18 +117,19 @@ pub const Connection = struct {
     ctx: *c.SSL_CTX,
     /// ALPN protocol negotiated during TLS handshake (e.g., "h2", "http/1.1").
     alpn_protocol: ?[]const u8 = null,
+    /// Read buffer — must outlive the returned slice from next().
+    read_buf: [16384]u8 = undefined,
 
     /// Returns next chunk of cleartext data, or null on end of stream.
     pub fn next(conn: *Connection) anyerror!?[]const u8 {
-        var buf: [16384]u8 = undefined;
-        const ret = c.SSL_read(conn.ssl, &buf, @intCast(buf.len));
+        const ret = c.SSL_read(conn.ssl, &conn.read_buf, @intCast(conn.read_buf.len));
         if (ret <= 0) {
             const err = c.SSL_get_error(conn.ssl, ret);
             if (err == c.SSL_ERROR_ZERO_RETURN) return null;
             return sslToError(err);
         }
         const n: usize = @intCast(ret);
-        return buf[0..n];
+        return conn.read_buf[0..n];
     }
 
     /// Encrypt and write all data to the underlying connection.
