@@ -101,6 +101,8 @@ pub const config = struct {
         host: []const u8,
         root_ca: cert.Bundle = .system,
         insecure_skip_verify: bool = false,
+        /// When true, only advertise http/1.1 via ALPN (skip h2).
+        disable_h2: bool = false,
     };
 
     pub const Server = struct {
@@ -281,9 +283,14 @@ pub fn client(fd: posix.fd_t, opts: config.Client) !Connection {
         }
     }
 
-    // ALPN: advertise h2 and http/1.1
-    const alpn = "\x02h2\x08http/1.1";
-    _ = c.SSL_CTX_set_alpn_protos(ctx, alpn, alpn.len);
+    // ALPN: advertise http/1.1 (and optionally h2)
+    if (opts.disable_h2) {
+        const alpn = "\x08http/1.1";
+        _ = c.SSL_CTX_set_alpn_protos(ctx, alpn, alpn.len);
+    } else {
+        const alpn = "\x02h2\x08http/1.1";
+        _ = c.SSL_CTX_set_alpn_protos(ctx, alpn, alpn.len);
+    }
 
     const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailure;
     errdefer c.SSL_free(ssl);
