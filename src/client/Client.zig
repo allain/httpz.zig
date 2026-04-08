@@ -113,6 +113,9 @@ h2c_write_buf: [8192]u8 = undefined,
 /// Persistent net reader/writer for streaming responses
 stream_reader: ?Io.net.Stream.Reader = null,
 stream_writer: ?Io.net.Stream.Writer = null,
+/// TLS reader/writer for streaming responses over TLS
+tls_reader_stream: ?tls.Connection.Reader = null,
+tls_read_buf_stream: [8192]u8 = undefined,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Client {
     const buf_size = @max(config.read_buffer_size, config.write_buffer_size);
@@ -212,12 +215,13 @@ pub const StreamResponse = struct {
 ///
 /// The caller must NOT call `response.deinit()` until done reading.
 pub fn requestStream(self: *Client, io: Io, method: Request.Method, uri: []const u8, headers: ?Headers, body: ?[]const u8) ResponseParseError!StreamResponse {
-    // HTTP/2 not supported for streaming — fall back to buffered
+    // HTTP/2 not supported for streaming
     if (self.h2_client != null) return error.InvalidResponse;
 
-    if (self.tls_conn != null) {
-        // TLS streaming not yet supported — requires incremental TLS reads
-        return error.InvalidResponse;
+    if (self.tls_conn) |*conn| {
+        try self.sendRequestTls(conn, method, uri, headers, body);
+        self.tls_reader_stream = conn.reader(&self.tls_read_buf_stream);
+        return try self.readResponseHeaders(&self.tls_reader_stream.?.interface);
     }
 
     const stream = self.stream orelse return error.ConnectionFailed;
