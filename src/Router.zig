@@ -53,7 +53,7 @@ pub const Method = enum {
 /// A single route definition. Use `method = .ALL` for routes that should
 /// match every HTTP verb.
 pub const Route = struct {
-    method: Method = .ALL,
+    method: Method,
     path: []const u8,
     handler: Handler,
     ws: ?struct { handler: WebSocket.Handler } = null,
