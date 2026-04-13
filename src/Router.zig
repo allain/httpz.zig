@@ -18,12 +18,42 @@ pub const Handler = Connection.Handler;
 /// Re-export Params from Request for backwards compatibility.
 pub const Params = Request.Params;
 
-/// A single route definition.
-///
-/// `method == null` matches any HTTP method — use this for prefix routes that
-/// should accept every verb (e.g. a proxy).
+/// Method selector for a route. Mirrors `Request.Method` and adds `ALL`, a
+/// wildcard that matches every verb — use it for prefix routes that should
+/// accept any method (e.g. a proxy).
+pub const Method = enum {
+    ALL,
+    GET,
+    HEAD,
+    POST,
+    PUT,
+    DELETE,
+    OPTIONS,
+    TRACE,
+    CONNECT,
+    PATCH,
+
+    /// True when this route method should accept the given HTTP method.
+    pub fn matches(self: Method, request_method: Request.Method) bool {
+        return switch (self) {
+            .ALL => true,
+            .GET => request_method == .GET,
+            .HEAD => request_method == .HEAD,
+            .POST => request_method == .POST,
+            .PUT => request_method == .PUT,
+            .DELETE => request_method == .DELETE,
+            .OPTIONS => request_method == .OPTIONS,
+            .TRACE => request_method == .TRACE,
+            .CONNECT => request_method == .CONNECT,
+            .PATCH => request_method == .PATCH,
+        };
+    }
+};
+
+/// A single route definition. Use `method = .ALL` for routes that should
+/// match every HTTP verb.
 pub const Route = struct {
-    method: ?Request.Method = null,
+    method: Method = .ALL,
     path: []const u8,
     handler: Handler,
     ws: ?struct { handler: WebSocket.Handler } = null,
@@ -42,8 +72,7 @@ pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: H
             const path = extractPath(request.uri);
 
             inline for (routes) |route| {
-                const method_ok = route.method == null or request.method == route.method.?;
-                if (method_ok) {
+                if (route.method.matches(request.method)) {
                     if (matchPath(route.path, path)) |params| {
                         var mutable_req = request.*;
                         mutable_req.params = params;
@@ -455,7 +484,7 @@ test "Router: matchPath named param then catch-all" {
 
 test "Router: any-method route matches all verbs" {
     const routes = [_]Route{
-        .{ .path = "/api/*rest", .handler = struct {
+        .{ .method = .ALL, .path = "/api/*rest", .handler = struct {
             fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
                 return Response.init(.ok, "text/plain", request.params.get("rest") orelse "");
             }
